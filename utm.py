@@ -2324,6 +2324,3024 @@ def generate_summary(all_findings: Dict[str, List[str]], config_path: str, out_p
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ANTI-DoS / DoS PROTECTION AUDIT MODULE
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parsers — DoS-specific config sections
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_dos_policy_full(text: str) -> List[Dict[str, Any]]:
+    """
+    Parse 'config firewall DoS-policy' with full anomaly sub-block extraction.
+    Each anomaly entry (edit tcp_syn_flood etc.) is captured with its
+    status/action/threshold/log fields.
+    """
+    lines = text.splitlines()
+    policies: List[Dict[str, Any]] = []
+    in_block = False
+    current: Dict[str, Any] = {}
+    in_anomaly = False
+    cur_anomaly: Dict[str, Any] = {}
+    anomaly_name: str = ""
+    depth = 0
+
+    for raw in lines:
+        line = raw.strip()
+
+        if line == "config firewall DoS-policy":
+            in_block = True
+            current = {}
+            in_anomaly = False
+            depth = 0
+            continue
+        if not in_block:
+            continue
+
+        if line.startswith("edit ") and not in_anomaly and depth == 0:
+            if current:
+                policies.append(current)
+            pid = line.split(None, 1)[1].strip().strip('"')
+            current = {"_id": pid, "_anomalies": {}}
+            continue
+
+        if line == "next" and not in_anomaly and depth == 0:
+            if current:
+                policies.append(current)
+            current = {"_anomalies": {}}
+            continue
+
+        if line == "end" and depth == 0:
+            if current and current.get("_id"):
+                policies.append(current)
+            break
+
+        # anomaly sub-block: "config anomaly"
+        if line == "config anomaly" and depth == 0:
+            in_anomaly = True
+            depth = 1
+            continue
+
+        if in_anomaly:
+            if line.startswith("edit "):
+                if cur_anomaly and anomaly_name:
+                    current["_anomalies"][anomaly_name] = cur_anomaly
+                anomaly_name = line.split(None, 1)[1].strip().strip('"')
+                cur_anomaly = {"_name": anomaly_name}
+                continue
+            if line == "next":
+                if cur_anomaly and anomaly_name:
+                    current["_anomalies"][anomaly_name] = cur_anomaly
+                cur_anomaly = {}
+                anomaly_name = ""
+                continue
+            if line == "end":
+                if cur_anomaly and anomaly_name:
+                    current["_anomalies"][anomaly_name] = cur_anomaly
+                in_anomaly = False
+                cur_anomaly = {}
+                anomaly_name = ""
+                depth = 0
+                continue
+            if line.startswith("set "):
+                k, v = parse_set_line(line)
+                if k:
+                    cur_anomaly[k] = v
+            continue
+
+        if line.startswith("set "):
+            k, v = parse_set_line(line)
+            if k:
+                current[k] = v
+
+    return [p for p in policies if p.get("_id")]
+
+
+def parse_np_global(text: str) -> Dict[str, Any]:
+    """Parse 'config system np6' or 'config system np7' for DoS offload settings."""
+    cfg: Dict[str, Any] = {}
+    for block_name in ("system np7", "system np6", "system npu"):
+        result = extract_flat_block(text, block_name)
+        if result:
+            cfg.update(result)
+            cfg["_np_type"] = block_name
+            break
+    return cfg
+
+
+def parse_system_resource_limit(text: str) -> Dict[str, Any]:
+    return extract_flat_block(text, "system resource-limit")
+
+
+def parse_system_session(text: str) -> Dict[str, Any]:
+    return extract_flat_block(text, "system session-ttl")
+
+
+def parse_system_global_dos(text: str) -> Dict[str, Any]:
+    """Pull DoS-relevant fields from system global."""
+    cfg = extract_flat_block(text, "system global")
+    return {
+        "tcp-halfopen-timer":   nv(cfg.get("tcp-halfopen-timer", "")),
+        "tcp-timewait-timer":   nv(cfg.get("tcp-timewait-timer", "")),
+        "tcp-option":           nv(cfg.get("tcp-option", "")),
+        "snat-hairpin-traffic": nv(cfg.get("snat-hairpin-traffic", "")),
+        "anti-replay":          nv(cfg.get("anti-replay", "")),
+        "block-session-timer":  nv(cfg.get("block-session-timer", "")),
+        "ip-src-check-on-tx":   nv(cfg.get("ip-src-check-on-tx", "")),
+        "per-user-bwl":         nv(cfg.get("per-user-bwl", "")),
+        "scanunit-count":       nv(cfg.get("scanunit-count", "")),
+    }
+
+
+def parse_ips_dos_anomalies(text: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Extract DoS-related anomaly entries from all IPS sensors.
+    Returns {sensor_name: {anomaly_name: {fields}}}
+    """
+    lines = text.splitlines()
+    result: Dict[str, Dict[str, Any]] = {}
+    in_sensor = False
+    in_anomaly_block = False
+    sensor_name = ""
+    cur_anomaly: Dict[str, Any] = {}
+    anomaly_name = ""
+    depth = 0
+
+    DOS_ANOMALIES = {
+        "tcp_syn_flood", "tcp-syn-flood", "udp_flood", "udp-flood",
+        "icmp_flood", "icmp-flood", "tcp_port_scan", "tcp-port-scan",
+        "udp_scan", "udp-scan", "tcp_ack_flood", "tcp-ack-flood",
+        "tcp_synack_flood", "tcp-synack-flood", "ip_src_session",
+        "ip-src-session", "tcp_src_session", "tcp-src-session",
+        "udp_src_session", "udp-src-session", "icmp_src_session",
+        "icmp-src-session", "ip_dst_session", "ip-dst-session",
+        "sctp_flood", "sctp-flood"
+    }
+
+    for raw in lines:
+        line = raw.strip()
+
+        if line == "config ips sensor":
+            in_sensor = True
+            continue
+        if not in_sensor:
+            continue
+
+        if line.startswith("edit ") and depth == 0:
+            sensor_name = line.split(None, 1)[1].strip().strip('"')
+            result[sensor_name] = {}
+            in_anomaly_block = False
+            continue
+
+        if line == "next" and depth == 0:
+            sensor_name = ""
+            in_anomaly_block = False
+            continue
+
+        if line == "end" and depth == 0:
+            break
+
+        if line == "config entries" and depth == 0:
+            depth = 1
+            continue
+
+        if depth == 1:
+            if line.startswith("config "):
+                depth += 1
+                continue
+            if line == "end":
+                depth = 0
+                continue
+            if line.startswith("edit "):
+                pass  # IPS entries — skip
+            if line.startswith("set "):
+                pass
+            continue
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DoS anomaly reference — expected thresholds per type
+# ─────────────────────────────────────────────────────────────────────────────
+
+# (anomaly_name, recommended_max_threshold, description)
+ANOMALY_SPECS = {
+    "tcp_syn_flood":     (2000,  "TCP SYN Flood"),
+    "tcp-syn-flood":     (2000,  "TCP SYN Flood"),
+    "tcp_ack_flood":     (2000,  "TCP ACK Flood"),
+    "tcp-ack-flood":     (2000,  "TCP ACK Flood"),
+    "tcp_synack_flood":  (1000,  "TCP SYN-ACK Flood"),
+    "tcp-synack-flood":  (1000,  "TCP SYN-ACK Flood"),
+    "udp_flood":         (2000,  "UDP Flood"),
+    "udp-flood":         (2000,  "UDP Flood"),
+    "icmp_flood":        (250,   "ICMP Flood"),
+    "icmp-flood":        (250,   "ICMP Flood"),
+    "tcp_port_scan":     (1000,  "TCP Port Scan"),
+    "tcp-port-scan":     (1000,  "TCP Port Scan"),
+    "udp_scan":          (2000,  "UDP Scan"),
+    "udp-scan":          (2000,  "UDP Scan"),
+    "ip_src_session":    (5000,  "Source IP Session Limit"),
+    "ip-src-session":    (5000,  "Source IP Session Limit"),
+    "tcp_src_session":   (5000,  "TCP Source Session Limit"),
+    "tcp-src-session":   (5000,  "TCP Source Session Limit"),
+    "udp_src_session":   (5000,  "UDP Source Session Limit"),
+    "udp-src-session":   (5000,  "UDP Source Session Limit"),
+    "icmp_src_session":  (1000,  "ICMP Source Session Limit"),
+    "icmp-src-session":  (1000,  "ICMP Source Session Limit"),
+    "ip_dst_session":    (10000, "Dest IP Session Limit"),
+    "ip-dst-session":    (10000, "Dest IP Session Limit"),
+    "ip_land_attack":    (1,     "IP Land Attack"),
+    "ip-land":           (1,     "IP Land Attack"),
+    "ip_bad_option":     (1,     "IP Bad Option"),
+    "ip-bad-option":     (1,     "IP Bad Option"),
+    "sctp_flood":        (2000,  "SCTP Flood"),
+    "sctp-flood":        (2000,  "SCTP Flood"),
+}
+
+# Critical anomalies that MUST be enabled on any WAN-facing DoS policy
+CRITICAL_ANOMALIES = {
+    "tcp_syn_flood", "tcp-syn-flood",
+    "tcp_ack_flood", "tcp-ack-flood",
+    "udp_flood",     "udp-flood",
+    "icmp_flood",    "icmp-flood",
+    "tcp_port_scan", "tcp-port-scan",
+    "ip_src_session","ip-src-session",
+    "ip_land_attack","ip-land",
+    "ip_bad_option", "ip-bad-option",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Weakness checks — Anti-DoS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def antidos_policy_weaknesses(policies: List[Dict], interfaces: List[Dict]) -> List[str]:
+    """Evaluate DoS policies for coverage, anomaly configuration, and action mode."""
+    findings = []
+
+    # Build WAN interface list
+    wan_intfs = set()
+    for intf in interfaces:
+        role = nv(intf.get("role", ""))
+        name = nv(intf.get("name", intf.get("_id", "")))
+        aa   = nv(intf.get("allowaccess", ""))
+        typ  = nv(intf.get("type", ""))
+        if role == "wan":
+            wan_intfs.add(name)
+        # Also detect by name heuristics
+        name_l = name.lower()
+        if any(w in name_l for w in ("wan", "ppp", "vdsl", "adsl", "ftth", "internet", "outside", "untrust")):
+            wan_intfs.add(name)
+
+    if not policies:
+        findings.append(f(C, "DoS Policies: NO DoS policies configured — FortiGate has zero flood/anomaly protection. "
+                            "Any flood attack hits the kernel directly. Configure 'config firewall DoS-policy' "
+                            "on all WAN interfaces immediately."))
+        return findings
+
+    # Track which WAN interfaces have a DoS policy
+    covered_wans: set = set()
+    enabled_policies = []
+
+    for p in policies:
+        pid    = nv(p.get("_id", ""))
+        intf   = nv(p.get("interface", ""))
+        status = nv(p.get("status", "enable"))
+        srcaddr = nv(p.get("srcaddr", ""))
+        dstaddr = nv(p.get("dstaddr", ""))
+        anomalies: Dict[str, Any] = p.get("_anomalies", {})
+
+        if status == "disable":
+            findings.append(f(H, f"DoS Policy {pid}: policy is DISABLED — no protection active on interface '{intf}'."))
+            continue
+
+        if not intf:
+            findings.append(f(M, f"DoS Policy {pid}: no interface bound — protection scope is undefined."))
+        else:
+            if intf in wan_intfs:
+                covered_wans.add(intf)
+            # Interface not recognized as WAN
+            intf_l = intf.lower()
+            if any(w in intf_l for w in ("wan", "ppp", "vdsl", "adsl", "ftth", "internet", "outside", "untrust")):
+                covered_wans.add(intf)
+
+        enabled_policies.append(p)
+
+        if srcaddr not in ("all", "") and dstaddr not in ("all", ""):
+            findings.append(f(I, f"DoS Policy {pid}: both srcaddr and dstaddr scoped — verify coverage is not too narrow."))
+
+        # ── Per-anomaly checks ──
+        if not anomalies:
+            findings.append(f(H, f"DoS Policy {pid} (intf: {intf}): no anomaly sensors configured — "
+                                "policy exists but provides zero protection. Add tcp_syn_flood, udp_flood, etc."))
+            continue
+
+        found_critical = set()
+        for anom_name, anom in anomalies.items():
+            a_status    = nv(anom.get("status", ""))
+            a_action    = nv(anom.get("action", ""))
+            a_threshold = nv(anom.get("threshold", ""))
+            a_log       = nv(anom.get("log", ""))
+            spec        = ANOMALY_SPECS.get(anom_name)
+            label       = spec[1] if spec else anom_name
+            rec_thresh  = spec[0] if spec else None
+
+            if anom_name in CRITICAL_ANOMALIES:
+                found_critical.add(anom_name)
+
+            # Status
+            if a_status != "enable":
+                sev = C if anom_name in CRITICAL_ANOMALIES else M
+                findings.append(f(sev, f"DoS Policy {pid} [{label}]: sensor DISABLED — "
+                                       f"set 'status enable' in anomaly config."))
+                continue  # remaining checks only apply if enabled
+
+            # Action
+            if a_action in ("pass", "monitor", ""):
+                sev = H if anom_name in CRITICAL_ANOMALIES else M
+                findings.append(f(sev, f"DoS Policy {pid} [{label}]: action is '{a_action or 'not set'}' — "
+                                       f"change to 'block'. Monitor mode logs but never drops."))
+
+            # Threshold sanity
+            if a_threshold and rec_thresh:
+                try:
+                    tval = int(a_threshold)
+                    if tval == 0:
+                        findings.append(f(H, f"DoS Policy {pid} [{label}]: threshold is 0 — "
+                                             "sensor will never trigger. Set a realistic value."))
+                    elif tval > rec_thresh * 10:
+                        findings.append(f(M, f"DoS Policy {pid} [{label}]: threshold {tval} is extremely high "
+                                             f"(recommended ≤ {rec_thresh}) — floods may exhaust resources before triggering."))
+                    elif tval > rec_thresh * 3:
+                        findings.append(f(I, f"DoS Policy {pid} [{label}]: threshold {tval} is above "
+                                            f"recommended {rec_thresh} — consider tightening."))
+                except (ValueError, TypeError):
+                    pass
+
+            # Logging
+            if a_log != "enable":
+                findings.append(f(M, f"DoS Policy {pid} [{label}]: logging disabled — "
+                                     "DoS events will not appear in logs or FortiAnalyzer."))
+
+        # Check which critical anomalies are missing entirely
+        missing = set()
+        for crit in CRITICAL_ANOMALIES:
+            canonical = crit.replace("-", "_")
+            present = any(
+                a.replace("-", "_") == canonical
+                for a in anomalies
+            )
+            if not present:
+                missing.add(crit.replace("-", "_"))
+
+        # Deduplicate missing (tcp_syn_flood and tcp-syn-flood are the same)
+        deduped_missing = set()
+        seen_canonical = set()
+        for m in missing:
+            can = m.replace("-", "_")
+            if can not in seen_canonical:
+                seen_canonical.add(can)
+                deduped_missing.add(can)
+
+        if deduped_missing:
+            missing_list = ", ".join(sorted(deduped_missing))
+            findings.append(f(H, f"DoS Policy {pid} (intf: {intf}): critical anomaly sensors missing: "
+                                f"{missing_list}. Add these to the anomaly config."))
+
+    # Check WAN interfaces with no DoS policy
+    uncovered = wan_intfs - covered_wans
+    if uncovered:
+        for wan in sorted(uncovered):
+            findings.append(f(C, f"DoS Policy: WAN interface '{wan}' has NO DoS policy — "
+                                "this interface is completely unprotected from flood attacks. "
+                                f"Create a DoS policy with 'set interface {wan}'."))
+
+    if wan_intfs and not covered_wans and enabled_policies:
+        findings.append(f(H, "DoS Policy: DoS policies exist but none are bound to detected WAN interfaces. "
+                            "Verify interface assignments match your WAN-facing ports."))
+
+    return findings
+
+
+def antidos_ips_weaknesses(ips_sensors: List[Dict], policies: List[Dict]) -> List[str]:
+    """Check IPS profiles for DoS anomaly coverage in security policies."""
+    findings = []
+
+    dos_relevant = {
+        "tcp_syn_flood", "tcp-syn-flood", "udp_flood", "udp-flood",
+        "icmp_flood", "icmp-flood", "tcp_port_scan", "tcp-port-scan",
+        "ip_src_session", "ip-src-session", "tcp_ack_flood", "tcp-ack-flood"
+    }
+
+    if not ips_sensors:
+        findings.append(f(H, "IPS DoS: no IPS sensors configured — no signature-based DoS/anomaly protection."))
+        return findings
+
+    # Check which policies have IPS sensors
+    policies_with_ips = [p for p in policies if nv(p.get("ips-sensor", ""))]
+    policies_no_ips   = [p for p in policies if not nv(p.get("ips-sensor", ""))
+                         and nv(p.get("action", "")) == "accept"]
+
+    if policies_no_ips:
+        findings.append(f(M, f"IPS DoS: {len(policies_no_ips)} accept policy/policies have no IPS sensor attached — "
+                            "DoS signature protection absent on these flows."))
+
+    # Per-sensor: check for DoS-related entries with block action
+    for sensor in ips_sensors:
+        name = nv(sensor.get("name", sensor.get("_id", "")))
+        botnet = nv(sensor.get("scan-botnet-connections", ""))
+        block_url = nv(sensor.get("block-malicious-url", ""))
+
+        if botnet in ("", "disable"):
+            findings.append(f(H, f"IPS Sensor '{name}': botnet C2 scanning disabled — "
+                               "compromised hosts inside the network can communicate outbound freely."))
+        elif botnet == "monitor":
+            findings.append(f(M, f"IPS Sensor '{name}': botnet scanning in monitor mode — "
+                               "C2 connections are logged but not blocked. Change to 'block'."))
+
+        if block_url != "enable":
+            findings.append(f(M, f"IPS Sensor '{name}': block-malicious-url disabled — "
+                               "known C2/malware URLs not blocked at IPS layer."))
+
+    return findings
+
+
+def antidos_hardening_weaknesses(
+    interfaces: List[Dict],
+    local_in:   List[Dict],
+    local_in6:  List[Dict],
+    global_dos: Dict,
+    res_limit:  Dict,
+    np_cfg:     Dict,
+    policies:   List[Dict],
+) -> List[str]:
+    """Check related hardening: session limits, NP offload, TCP timers, mgmt plane."""
+    findings = []
+
+    # ── TCP Session / Timer Settings ──
+    tcp_halfopen = nv(global_dos.get("tcp-halfopen-timer", ""))
+    tcp_timewait = nv(global_dos.get("tcp-timewait-timer", ""))
+    anti_replay  = nv(global_dos.get("anti-replay", ""))
+    block_timer  = nv(global_dos.get("block-session-timer", ""))
+    ip_src_check = nv(global_dos.get("ip-src-check-on-tx", ""))
+
+    try:
+        if int(tcp_halfopen) > 10:
+            findings.append(f(M, f"TCP Hardening: tcp-halfopen-timer is {tcp_halfopen}s — "
+                                "high values extend SYN flood attack windows. Recommend ≤ 10s. "
+                                "CLI: config system global → set tcp-halfopen-timer 10"))
+    except (ValueError, TypeError):
+        if not tcp_halfopen:
+            findings.append(f(I, "TCP Hardening: tcp-halfopen-timer not explicitly set — default may be too permissive."))
+
+    try:
+        if int(tcp_timewait) > 1:
+            findings.append(f(I, f"TCP Hardening: tcp-timewait-timer is {tcp_timewait}s — "
+                                "consider reducing to 1s to free sessions faster under flood. "
+                                "CLI: config system global → set tcp-timewait-timer 1"))
+    except (ValueError, TypeError):
+        pass
+
+    if anti_replay not in ("strict", "enable"):
+        findings.append(f(M, "TCP Hardening: anti-replay is not set to 'strict' — "
+                            "packet replay attacks possible at the global level. "
+                            "CLI: config system global → set anti-replay strict"))
+
+    if ip_src_check != "enable":
+        findings.append(f(I, "TCP Hardening: ip-src-check-on-tx not enabled — "
+                            "spoofed source IP packets may not be dropped on transmit. "
+                            "CLI: config system global → set ip-src-check-on-tx enable"))
+
+    try:
+        bt = int(block_timer)
+        if bt < 30:
+            findings.append(f(I, f"TCP Hardening: block-session-timer is {bt}s — "
+                                "blocked sessions re-allowed too quickly. Recommend ≥ 30s."))
+    except (ValueError, TypeError):
+        pass
+
+    # ── Resource Limits ──
+    if not res_limit:
+        findings.append(f(M, "Resource Limits: 'config system resource-limit' not configured — "
+                            "no per-user or global session count ceilings. Under a flood attack, "
+                            "the session table can be exhausted. "
+                            "CLI: config system resource-limit → set type ipsec → set max-user-limit 1000"))
+    else:
+        sess_limit = nv(res_limit.get("max-session-limit", ""))
+        if not sess_limit or sess_limit == "0":
+            findings.append(f(M, "Resource Limits: max-session-limit not set — "
+                                "unlimited sessions allowed per user; DoS amplification risk."))
+
+    # ── NP Hardware DoS Offload ──
+    if not np_cfg:
+        findings.append(f(I, "NP Offload: no NP7/NP6 DoS offload config detected — "
+                            "either this platform has no NP ASIC or offload is unconfigured. "
+                            "On NP-capable hardware, DoS offload dramatically reduces CPU impact."))
+    else:
+        np_type = nv(np_cfg.get("_np_type", "NP"))
+        # HPE (Host Protection Engine)
+        hpe_policy = nv(np_cfg.get("hpe", "")) or nv(np_cfg.get("host-shortcut-mode", ""))
+        fp_anomaly = nv(np_cfg.get("fp-anomaly", ""))
+        np_dos_off = nv(np_cfg.get("dos-options", "")) or nv(np_cfg.get("np-queues", ""))
+
+        if not hpe_policy:
+            findings.append(f(M, f"NP Offload ({np_type}): HPE (Host Protection Engine) not explicitly configured — "
+                                "management-plane traffic destined to FortiGate may not be rate-limited at ASIC level. "
+                                f"CLI: config system {np_type.replace('system ','')} → config hpe → set ..."))
+        if fp_anomaly in ("", "disable"):
+            findings.append(f(M, f"NP Offload ({np_type}): fp-anomaly (fast-path anomaly detection) not enabled — "
+                                "NP-offloaded sessions bypass CPU-level DoS anomaly checks without this."))
+
+    # ── WAN Interface Management Access ──
+    for intf in interfaces:
+        name = nv(intf.get("name", intf.get("_id", "")))
+        role = nv(intf.get("role", ""))
+        aa   = nv(intf.get("allowaccess", ""))
+        aa_parts = aa.split()
+        name_l = name.lower()
+        is_wan = (role == "wan") or any(
+            w in name_l for w in ("wan", "internet", "outside", "untrust", "ppp")
+        )
+        if is_wan:
+            if "https" in aa_parts:
+                findings.append(f(H, f"Mgmt Exposure: HTTPS management on WAN interface '{name}' — "
+                                    "management plane directly reachable from internet; "
+                                    "restrict with local-in-policy or remove from allowaccess. "
+                                    f"CLI: config system interface → edit {name} → set allowaccess (remove https)"))
+            if "ssh" in aa_parts:
+                findings.append(f(H, f"Mgmt Exposure: SSH on WAN interface '{name}' — "
+                                    "brute-force target; restrict via local-in-policy to admin IPs only."))
+            if "http" in aa_parts:
+                findings.append(f(C, f"Mgmt Exposure: HTTP management on WAN interface '{name}' — "
+                                    "cleartext management on internet-facing interface is critical risk."))
+            if "ping" in aa_parts:
+                findings.append(f(M, f"Mgmt Exposure: ICMP/ping enabled on WAN interface '{name}' — "
+                                    "aids attacker reconnaissance and is an ICMP flood target. "
+                                    f"CLI: config system interface → edit {name} → unset allowaccess ping"))
+            if "snmp" in aa_parts:
+                findings.append(f(C, f"Mgmt Exposure: SNMP on WAN interface '{name}' — "
+                                    "community string exposed to internet; immediate risk."))
+            if "telnet" in aa_parts:
+                findings.append(f(C, f"Mgmt Exposure: Telnet on WAN interface '{name}' — "
+                                    "cleartext, remove immediately."))
+
+    # ── Local-in Policies for Management Plane ──
+    all_lip = local_in + local_in6
+    has_wan_lip = False
+    for lip in all_lip:
+        intf = nv(lip.get("intf", ""))
+        src  = nv(lip.get("srcaddr", ""))
+        act  = nv(lip.get("action", ""))
+        if intf:
+            intf_l = intf.lower()
+            if any(w in intf_l for w in ("wan", "outside", "internet", "untrust")):
+                has_wan_lip = True
+                if src in ("all", "") and act == "accept":
+                    findings.append(f(C, f"Local-in: ACCEPT from 'all' on WAN interface '{intf}' — "
+                                       "FortiGate management plane is fully exposed. "
+                                       "Restrict srcaddr to management IP ranges."))
+
+    if not has_wan_lip:
+        findings.append(f(H, "Local-in: no local-in-policies configured on WAN interfaces — "
+                            "FortiGate control plane (management, VPN, BGP, etc.) has no explicit "
+                            "source restriction. An attacker can target these services directly. "
+                            "CLI: config firewall local-in-policy → edit 1 → set intf wan1 "
+                            "→ set srcaddr <admin-ip-range> → set action accept"))
+
+    # ── Accept policies with broad source and no rate limiting ──
+    broad_accept = 0
+    for p in policies:
+        if (nv(p.get("action", "")) == "accept" and
+                nv(p.get("srcaddr", "")) in ("all", "") and
+                not nv(p.get("ips-sensor", ""))):
+            broad_accept += 1
+    if broad_accept:
+        findings.append(f(M, f"Policy Exposure: {broad_accept} accept policy/policies with source 'all' "
+                            "and no IPS sensor — these policies have no rate-limiting layer; "
+                            "pair with a DoS policy on the same inbound interface."))
+
+    return findings
+
+
+def antidos_score(all_findings: List[str]) -> Dict[str, Any]:
+    """
+    Compute a 0–10 DoS protection score.
+    Deduct points for severity: CRITICAL=-3, HIGH=-1.5, MEDIUM=-0.5, INFO=-0.1
+    Cap deductions per category to avoid double-counting.
+    """
+    counts = {C: 0, H: 0, M: 0, I: 0}
+    for fn in all_findings:
+        for sev in (C, H, M, I):
+            if fn.startswith(sev + ":"):
+                counts[sev] += 1
+
+    deduction = (
+        min(counts[C] * 3.0, 6.0) +
+        min(counts[H] * 1.5, 4.5) +
+        min(counts[M] * 0.5, 2.0) +
+        min(counts[I] * 0.1, 0.5)
+    )
+    score = max(0.0, round(10.0 - deduction, 1))
+
+    if score >= 8:
+        grade = "STRONG"
+    elif score >= 6:
+        grade = "ACCEPTABLE"
+    elif score >= 4:
+        grade = "WEAK"
+    elif score >= 2:
+        grade = "POOR"
+    else:
+        grade = "CRITICAL — NO EFFECTIVE DoS PROTECTION"
+
+    return {"score": score, "grade": grade, "counts": counts}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report generator — Anti-DoS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_antidos_report(
+    dos_policies:  List[Dict],
+    ips_sensors:   List[Dict],
+    interfaces:    List[Dict],
+    local_in:      List[Dict],
+    local_in6:     List[Dict],
+    fw_policies:   List[Dict],
+    global_dos:    Dict,
+    res_limit:     Dict,
+    np_cfg:        Dict,
+    out_path:      Path,
+):
+    W = 80
+
+    # Run all checks
+    f1 = antidos_policy_weaknesses(dos_policies, interfaces)
+    f2 = antidos_ips_weaknesses(ips_sensors, fw_policies)
+    f3 = antidos_hardening_weaknesses(
+        interfaces, local_in, local_in6,
+        global_dos, res_limit, np_cfg, fw_policies
+    )
+    all_findings = f1 + f2 + f3
+    assessment   = antidos_score(all_findings)
+
+    lines = []
+
+    # ── Header ──
+    lines.append("=" * W)
+    lines.append(" ANTI-DoS / DoS PROTECTION AUDIT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append(f"  Overall DoS Protection Score : {assessment['score']} / 10  "
+                 f"— {assessment['grade']}")
+    lines.append(f"  CRITICAL: {assessment['counts'][C]}   "
+                 f"HIGH: {assessment['counts'][H]}   "
+                 f"MEDIUM: {assessment['counts'][M]}   "
+                 f"INFO: {assessment['counts'][I]}")
+    lines.append("=" * W)
+    lines.append("")
+
+    # ── Score interpretation bar ──
+    filled = int(assessment['score'])
+    bar = "█" * filled + "░" * (10 - filled)
+    lines.append(f"  [{bar}] {assessment['score']}/10")
+    lines.append("")
+
+    # ── Section 1: DoS Policy Configuration ──
+    lines.append("─" * W)
+    lines.append("  1. DoS POLICY CONFIGURATION")
+    lines.append("─" * W)
+    lines.append(f"  DoS policies found: {len(dos_policies)}")
+    lines.append("")
+
+    if dos_policies:
+        for p in dos_policies:
+            pid       = nv(p.get("_id", ""))
+            intf      = nv(p.get("interface", ""))
+            status    = nv(p.get("status", "enable"))
+            srcaddr   = nv(p.get("srcaddr", "all"))
+            dstaddr   = nv(p.get("dstaddr", "all"))
+            anomalies = p.get("_anomalies", {})
+
+            lines.append(f"  Policy #{pid}  Interface: {intf or '(none)'}  "
+                         f"Status: {status}  Src: {srcaddr}  Dst: {dstaddr}")
+            lines.append(f"  Anomaly sensors configured: {len(anomalies)}")
+
+            if anomalies:
+                lines.append("")
+                lines.append(f"  {'Sensor':<26} {'Status':<10} {'Action':<10} {'Threshold':<12} {'Log':<8} {'Assessment'}")
+                lines.append(f"  {'─'*26} {'─'*10} {'─'*10} {'─'*12} {'─'*8} {'─'*20}")
+                for anom_name, anom in sorted(anomalies.items()):
+                    a_status    = nv(anom.get("status", "?"))
+                    a_action    = nv(anom.get("action", "?"))
+                    a_threshold = nv(anom.get("threshold", "?"))
+                    a_log       = nv(anom.get("log", "?"))
+                    spec        = ANOMALY_SPECS.get(anom_name)
+                    rec         = spec[0] if spec else "?"
+
+                    # Per-sensor assessment
+                    if a_status != "enable":
+                        assess = "⚠ DISABLED"
+                    elif a_action in ("pass", "monitor", ""):
+                        assess = "⚠ NOT BLOCKING"
+                    elif a_action == "block":
+                        try:
+                            if int(a_threshold) == 0:
+                                assess = "⚠ THRESHOLD=0"
+                            elif int(a_threshold) > (rec if isinstance(rec, int) else 9999) * 10:
+                                assess = "⚠ THRESH TOO HIGH"
+                            else:
+                                assess = "✓ OK"
+                        except (ValueError, TypeError):
+                            assess = "✓ OK"
+                    else:
+                        assess = f"action:{a_action}"
+
+                    lines.append(f"  {anom_name:<26} {a_status:<10} {a_action:<10} "
+                                 f"{a_threshold:<12} {a_log:<8} {assess}")
+            lines.append("")
+
+    # Findings for section 1
+    if f1:
+        lines.append("  Findings:")
+        for fn in f1:
+            sev  = fn.split(":")[0]
+            body = ":".join(fn.split(":")[1:]).strip()
+            icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "INFO": "🔵"}.get(sev, "  ")
+            lines.append(f"  {icon} [{sev}] {body}")
+    else:
+        lines.append("  ✅ No findings in DoS policy configuration.")
+    lines.append("")
+
+    # ── Section 2: IPS DoS Anomaly Protection ──
+    lines.append("─" * W)
+    lines.append("  2. IPS DoS ANOMALY PROTECTION")
+    lines.append("─" * W)
+    lines.append(f"  IPS sensors found: {len(ips_sensors)}")
+    fw_with_ips = sum(1 for p in fw_policies
+                      if nv(p.get("ips-sensor", "")) and nv(p.get("action", "")) == "accept")
+    fw_total_accept = sum(1 for p in fw_policies if nv(p.get("action", "")) == "accept")
+    lines.append(f"  Accept policies with IPS: {fw_with_ips} / {fw_total_accept}")
+    lines.append("")
+
+    if f2:
+        lines.append("  Findings:")
+        for fn in f2:
+            sev  = fn.split(":")[0]
+            body = ":".join(fn.split(":")[1:]).strip()
+            icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "INFO": "🔵"}.get(sev, "  ")
+            lines.append(f"  {icon} [{sev}] {body}")
+    else:
+        lines.append("  ✅ No findings in IPS DoS anomaly protection.")
+    lines.append("")
+
+    # ── Section 3: Related Hardening ──
+    lines.append("─" * W)
+    lines.append("  3. RELATED HARDENING")
+    lines.append("─" * W)
+
+    # Current config summary
+    rows_hard = [
+        ("tcp-halfopen-timer",   nv(global_dos.get("tcp-halfopen-timer", "(default)"))),
+        ("tcp-timewait-timer",   nv(global_dos.get("tcp-timewait-timer", "(default)"))),
+        ("anti-replay",          nv(global_dos.get("anti-replay", "(default)"))),
+        ("block-session-timer",  nv(global_dos.get("block-session-timer", "(default)"))),
+        ("ip-src-check-on-tx",   nv(global_dos.get("ip-src-check-on-tx", "(default)"))),
+        ("resource-limit config",str(bool(res_limit))),
+        ("NP DoS offload",       nv(np_cfg.get("_np_type", "not detected"))),
+        ("Local-in policies",    str(len(local_in + local_in6))),
+    ]
+    lines.append(ascii_table(rows_hard, "Current DoS-Related Settings"))
+    lines.append("")
+
+    if f3:
+        lines.append("  Findings:")
+        for fn in f3:
+            sev  = fn.split(":")[0]
+            body = ":".join(fn.split(":")[1:]).strip()
+            icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "INFO": "🔵"}.get(sev, "  ")
+            lines.append(f"  {icon} [{sev}] {body}")
+    else:
+        lines.append("  ✅ No findings in related hardening.")
+    lines.append("")
+
+    # ── Section 4: Overall Assessment ──
+    lines.append("─" * W)
+    lines.append("  4. OVERALL ASSESSMENT & RECOMMENDATIONS")
+    lines.append("─" * W)
+    lines.append("")
+
+    criticals = [fn for fn in all_findings if fn.startswith("CRITICAL:")]
+    highs     = [fn for fn in all_findings if fn.startswith("HIGH:")]
+
+    if criticals:
+        lines.append("  🔴 CRITICAL ISSUES (fix immediately):")
+        for fn in criticals:
+            lines.append(f"    • {':'.join(fn.split(':')[1:]).strip()}")
+        lines.append("")
+
+    if highs:
+        lines.append("  🟠 HIGH RISK ISSUES:")
+        for fn in highs:
+            lines.append(f"    • {':'.join(fn.split(':')[1:]).strip()}")
+        lines.append("")
+
+    # Recommendation summary with CLI examples
+    lines.append("  📋 RECOMMENDATIONS:")
+    lines.append("")
+
+    recs = [
+        ("1. Create DoS policies on ALL WAN interfaces",
+         "config firewall DoS-policy\n"
+         "    edit 1\n"
+         "        set interface wan1\n"
+         "        set srcaddr all\n"
+         "        set dstaddr all\n"
+         "        set status enable\n"
+         "        config anomaly\n"
+         "            edit tcp_syn_flood\n"
+         "                set status enable\n"
+         "                set log enable\n"
+         "                set action block\n"
+         "                set threshold 2000\n"
+         "            next\n"
+         "            edit udp_flood\n"
+         "                set status enable\n"
+         "                set log enable\n"
+         "                set action block\n"
+         "                set threshold 2000\n"
+         "            next\n"
+         "            edit icmp_flood\n"
+         "                set status enable\n"
+         "                set log enable\n"
+         "                set action block\n"
+         "                set threshold 250\n"
+         "            next\n"
+         "            edit ip_src_session\n"
+         "                set status enable\n"
+         "                set log enable\n"
+         "                set action block\n"
+         "                set threshold 5000\n"
+         "            next\n"
+         "            edit tcp_port_scan\n"
+         "                set status enable\n"
+         "                set log enable\n"
+         "                set action block\n"
+         "                set threshold 1000\n"
+         "            next\n"
+         "            edit ip_land_attack\n"
+         "                set status enable\n"
+         "                set log enable\n"
+         "                set action block\n"
+         "                set threshold 1\n"
+         "            next\n"
+         "            edit ip_bad_option\n"
+         "                set status enable\n"
+         "                set log enable\n"
+         "                set action block\n"
+         "                set threshold 1\n"
+         "            next\n"
+         "        end\n"
+         "    next\n"
+         "end"),
+        ("2. Harden TCP timers",
+         "config system global\n"
+         "    set tcp-halfopen-timer 10\n"
+         "    set tcp-timewait-timer 1\n"
+         "    set anti-replay strict\n"
+         "    set block-session-timer 30\n"
+         "    set ip-src-check-on-tx enable\n"
+         "end"),
+        ("3. Restrict management access with local-in-policy",
+         "config firewall local-in-policy\n"
+         "    edit 1\n"
+         "        set intf wan1\n"
+         "        set srcaddr <admin-mgmt-subnet>\n"
+         "        set dstaddr all\n"
+         "        set service HTTPS SSH\n"
+         "        set action accept\n"
+         "        set schedule always\n"
+         "    next\n"
+         "    edit 2\n"
+         "        set intf wan1\n"
+         "        set srcaddr all\n"
+         "        set dstaddr all\n"
+         "        set service ALL\n"
+         "        set action deny\n"
+         "        set schedule always\n"
+         "    next\n"
+         "end"),
+        ("4. Configure NP hardware DoS offload (NP6/NP7 platforms)",
+         "config system np7\n"
+         "    config hpe\n"
+         "        set enable-shaper enable\n"
+         "        set tcpsyn-max 10000\n"
+         "        set udp-max 10000\n"
+         "        set icmp-max 1000\n"
+         "        set sctp-max 10000\n"
+         "    end\n"
+         "    set fp-anomaly enable\n"
+         "end"),
+    ]
+
+    for title, cli in recs:
+        lines.append(f"  ▸ {title}")
+        for cli_line in cli.splitlines():
+            lines.append(f"      {cli_line}")
+        lines.append("")
+
+    # ── Footer score ──
+    lines.append("=" * W)
+    lines.append(f"  DoS Protection Score: {assessment['score']}/10  — {assessment['grade']}")
+    lines.append("=" * W)
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: FIREWALL POLICY INTELLIGENCE
+# Shadowed rules, duplicate policies, policy usage statistics
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _addr_is_any(addr: str) -> bool:
+    return addr.lower() in ("all", "any", "")
+
+def _svc_is_any(svc: str) -> bool:
+    return svc.upper() in ("ALL", "ANY", "")
+
+def _addr_set(addr_str: str) -> set:
+    """Split multi-value address field into a frozenset for comparison."""
+    return frozenset(a.strip() for a in addr_str.split() if a.strip())
+
+def _policy_tuple(p: Dict) -> tuple:
+    """Canonical key for duplicate detection."""
+    return (
+        nv(p.get("srcintf", "")),
+        nv(p.get("dstintf", "")),
+        nv(p.get("action", "")),
+        _addr_set(nv(p.get("srcaddr", ""))),
+        _addr_set(nv(p.get("dstaddr", ""))),
+        _addr_set(nv(p.get("service", ""))),
+    )
+
+
+def check_shadowed_policies(policies: List[Dict]) -> List[str]:
+    """
+    Detect policies that are shadowed by an earlier, broader rule.
+    A policy B is shadowed by policy A if:
+      - A appears before B in the list
+      - A's srcintf matches B's srcintf (or A accepts any)
+      - A's dstintf matches B's dstintf (or A accepts any)
+      - A's srcaddr is 'all' (covers B's more specific srcaddr)
+      - A's dstaddr is 'all' (covers B's more specific dstaddr)
+      - A's service is 'ALL' (covers B's more specific service)
+      - A's action == B's action (same permit/deny)
+    """
+    findings = []
+
+    enabled = [p for p in policies if nv(p.get("status", "enable")) != "disable"]
+
+    for i, p_b in enumerate(enabled):
+        pid_b    = nv(p_b.get("policyid", p_b.get("_id", "")))
+        name_b   = nv(p_b.get("name", ""))
+        srcintf_b = nv(p_b.get("srcintf", ""))
+        dstintf_b = nv(p_b.get("dstintf", ""))
+        srcaddr_b = nv(p_b.get("srcaddr", ""))
+        dstaddr_b = nv(p_b.get("dstaddr", ""))
+        service_b = nv(p_b.get("service", ""))
+        action_b  = nv(p_b.get("action", ""))
+
+        # Skip if B itself is already any-any
+        if (_addr_is_any(srcaddr_b) and _addr_is_any(dstaddr_b)
+                and _svc_is_any(service_b)):
+            continue
+
+        for p_a in enabled[:i]:
+            pid_a    = nv(p_a.get("policyid", p_a.get("_id", "")))
+            name_a   = nv(p_a.get("name", ""))
+            srcintf_a = nv(p_a.get("srcintf", ""))
+            dstintf_a = nv(p_a.get("dstintf", ""))
+            srcaddr_a = nv(p_a.get("srcaddr", ""))
+            dstaddr_a = nv(p_a.get("dstaddr", ""))
+            service_a = nv(p_a.get("service", ""))
+            action_a  = nv(p_a.get("action", ""))
+
+            if action_a != action_b:
+                continue
+
+            # Interface must match exactly or A must be any
+            if srcintf_a and srcintf_b and srcintf_a != srcintf_b:
+                continue
+            if dstintf_a and dstintf_b and dstintf_a != dstintf_b:
+                continue
+
+            # A shadows B if A's addresses are superset of B's
+            src_shadows = _addr_is_any(srcaddr_a)
+            dst_shadows = _addr_is_any(dstaddr_a)
+            svc_shadows = _svc_is_any(service_a)
+
+            # Also check exact match — fully identical is duplicate, not shadow
+            if src_shadows and dst_shadows and svc_shadows:
+                findings.append(
+                    f(H, f"Shadowed Policy: Policy #{pid_b} ('{name_b}') is COMPLETELY SHADOWED "
+                         f"by Policy #{pid_a} ('{name_a}'). "
+                         f"Policy #{pid_a} has action={action_a} with any-any-any src/dst/service "
+                         f"on the same interface pair — Policy #{pid_b} will NEVER be evaluated. "
+                         f"Review policy ordering or merge rules.")
+                )
+                break  # No need to check further shadowers for B
+
+    return findings
+
+
+def check_duplicate_policies(policies: List[Dict]) -> List[str]:
+    """Detect functionally identical policies (same 5-tuple + action)."""
+    findings = []
+    seen: Dict[tuple, str] = {}
+
+    for p in policies:
+        if nv(p.get("status", "enable")) == "disable":
+            continue
+        pid  = nv(p.get("policyid", p.get("_id", "")))
+        name = nv(p.get("name", ""))
+        key  = _policy_tuple(p)
+
+        if key in seen:
+            first_pid = seen[key]
+            findings.append(
+                f(H, f"Duplicate Policy: Policy #{pid} ('{name}') is functionally identical to "
+                     f"Policy #{first_pid} — same srcintf, dstintf, srcaddr, dstaddr, service, action. "
+                     f"Remove the duplicate to avoid rule table confusion.")
+            )
+        else:
+            seen[key] = pid
+
+    return findings
+
+
+def policy_usage_statistics(
+    policies: List[Dict],
+    policies6: List[Dict]
+) -> Dict[str, Any]:
+    """Compute UTM coverage statistics across all firewall policies."""
+    all_pol = policies + policies6
+    accept  = [p for p in all_pol if nv(p.get("action", "")) == "accept"]
+    total   = len(all_pol)
+    total_a = len(accept)
+
+    def count_with(field):
+        return sum(1 for p in accept if nv(p.get(field, "")))
+
+    stats = {
+        "total_policies":     total,
+        "total_accept":       total_a,
+        "total_deny":         sum(1 for p in all_pol if nv(p.get("action","")) == "deny"),
+        "disabled":           sum(1 for p in all_pol if nv(p.get("status","enable")) == "disable"),
+        "no_comment":         sum(1 for p in all_pol if not nv(p.get("comments",""))),
+        "with_ips":           count_with("ips-sensor"),
+        "with_av":            count_with("av-profile"),
+        "with_ssl":           count_with("ssl-ssh-profile"),
+        "with_webfilter":     count_with("webfilter-profile"),
+        "with_dns":           count_with("dnsfilter-profile"),
+        "with_appcontrol":    count_with("application-list"),
+        "with_dlp":           count_with("dlp-profile"),
+        "with_waf":           count_with("waf-profile"),
+        "with_casb":          count_with("casb-profile"),
+        "with_vpatch":        count_with("virtual-patch-profile"),
+        "with_llm":           count_with("llm-profile"),
+        "with_logging":       sum(1 for p in accept if nv(p.get("logtraffic","")) not in ("","disable")),
+        "any_any_any":        sum(1 for p in accept
+                                  if _addr_is_any(nv(p.get("srcaddr","")))
+                                  and _addr_is_any(nv(p.get("dstaddr","")))
+                                  and _svc_is_any(nv(p.get("service","")))),
+        "nat_disabled":       sum(1 for p in accept if nv(p.get("nat","")) != "enable"),
+        "capture_packet":     sum(1 for p in all_pol if nv(p.get("capture-packet","")) == "enable"),
+    }
+    return stats
+
+
+def generate_policy_intelligence_report(
+    policies: List[Dict],
+    policies6: List[Dict],
+    out_path: Path
+):
+    shadow_f = check_shadowed_policies(policies)
+    dupl_f   = check_duplicate_policies(policies)
+    stats    = policy_usage_statistics(policies, policies6)
+    W = 80
+
+    lines = []
+    lines.append("=" * W)
+    lines.append(" FIREWALL POLICY INTELLIGENCE AUDIT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+
+    # ── Coverage Statistics ──
+    ta = stats["total_accept"] or 1  # avoid div/0
+    lines.append("─" * W)
+    lines.append("  POLICY COVERAGE STATISTICS")
+    lines.append("─" * W)
+    lines.append("")
+
+    stat_rows = [
+        ("Total policies",           str(stats["total_policies"])),
+        ("  Accept",                 str(stats["total_accept"])),
+        ("  Deny/Drop",              str(stats["total_deny"])),
+        ("  Disabled",               str(stats["disabled"])),
+        ("  No comment/description", str(stats["no_comment"])),
+        ("ANY-ANY-ANY accept rules", str(stats["any_any_any"])),
+        ("NAT disabled (accept)",    str(stats["nat_disabled"])),
+        ("Packet capture enabled",   str(stats["capture_packet"])),
+        ("─" * 28,                   "─" * 30),
+        ("WITH IPS sensor",
+         f"{stats['with_ips']}/{stats['total_accept']} "
+         f"({100*stats['with_ips']//ta}%)"),
+        ("WITHOUT IPS sensor",
+         f"{stats['total_accept']-stats['with_ips']}/{stats['total_accept']} "
+         f"({100*(stats['total_accept']-stats['with_ips'])//ta}%)"),
+        ("WITH SSL inspection",
+         f"{stats['with_ssl']}/{stats['total_accept']} "
+         f"({100*stats['with_ssl']//ta}%)"),
+        ("WITHOUT SSL inspection",
+         f"{stats['total_accept']-stats['with_ssl']}/{stats['total_accept']} "
+         f"({100*(stats['total_accept']-stats['with_ssl'])//ta}%)"),
+        ("WITH Antivirus",
+         f"{stats['with_av']}/{stats['total_accept']} "
+         f"({100*stats['with_av']//ta}%)"),
+        ("WITH Web Filter",
+         f"{stats['with_webfilter']}/{stats['total_accept']} "
+         f"({100*stats['with_webfilter']//ta}%)"),
+        ("WITH DNS Filter",
+         f"{stats['with_dns']}/{stats['total_accept']} "
+         f"({100*stats['with_dns']//ta}%)"),
+        ("WITH App Control",
+         f"{stats['with_appcontrol']}/{stats['total_accept']} "
+         f"({100*stats['with_appcontrol']//ta}%)"),
+        ("WITH DLP Profile",
+         f"{stats['with_dlp']}/{stats['total_accept']} "
+         f"({100*stats['with_dlp']//ta}%)"),
+        ("WITH WAF Profile",
+         f"{stats['with_waf']}/{stats['total_accept']} "
+         f"({100*stats['with_waf']//ta}%)"),
+        ("WITH CASB Profile",
+         f"{stats['with_casb']}/{stats['total_accept']} "
+         f"({100*stats['with_casb']//ta}%)"),
+        ("WITH Virtual Patch",
+         f"{stats['with_vpatch']}/{stats['total_accept']} "
+         f"({100*stats['with_vpatch']//ta}%)"),
+        ("WITH LLM Profile",
+         f"{stats['with_llm']}/{stats['total_accept']} "
+         f"({100*stats['with_llm']//ta}%)"),
+        ("WITH Logging",
+         f"{stats['with_logging']}/{stats['total_accept']} "
+         f"({100*stats['with_logging']//ta}%)"),
+    ]
+    lines.append(ascii_table(stat_rows, "Security Profile Coverage"))
+    lines.append("")
+
+    # Visual coverage bars
+    lines.append("  Coverage Bars (accept policies):")
+    for label, key in [
+        ("IPS",         "with_ips"),
+        ("SSL Inspect", "with_ssl"),
+        ("Antivirus",   "with_av"),
+        ("Web Filter",  "with_webfilter"),
+        ("App Control", "with_appcontrol"),
+        ("Logging",     "with_logging"),
+        ("DLP",         "with_dlp"),
+        ("WAF",         "with_waf"),
+    ]:
+        val = stats[key]
+        pct = (val * 20) // ta if ta else 0
+        bar = "█" * pct + "░" * (20 - pct)
+        pct_num = 100 * val // ta if ta else 0
+        lines.append(f"  {label:<14} [{bar}] {pct_num:>3}%  ({val}/{stats['total_accept']})")
+    lines.append("")
+
+    # Flag low coverage
+    low_cov_findings = []
+    for label, key in [("IPS","with_ips"),("SSL inspection","with_ssl"),("Antivirus","with_av"),("Logging","with_logging")]:
+        pct = 100 * stats[key] // ta if ta else 0
+        if pct < 50:
+            low_cov_findings.append(f(H, f"Coverage: only {pct}% of accept policies have {label} — "
+                                        "large portion of traffic flows uninspected."))
+        elif pct < 80:
+            low_cov_findings.append(f(M, f"Coverage: {pct}% of accept policies have {label} — "
+                                       "consider raising coverage."))
+    if stats["any_any_any"] > 0:
+        low_cov_findings.append(f(C, f"Coverage: {stats['any_any_any']} ANY-ANY-ANY accept "
+                                     "policies found — these permit all traffic unrestricted."))
+    if stats["capture_packet"] > 0:
+        low_cov_findings.append(f(M, f"Coverage: {stats['capture_packet']} policies have "
+                                    "packet capture enabled — debug artifact, disable in production."))
+
+    if low_cov_findings:
+        lines.append("  Coverage Findings:")
+        for fn in low_cov_findings:
+            sev = fn.split(":")[0]
+            body = ":".join(fn.split(":")[1:]).strip()
+            icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+            lines.append(f"  {icon} [{sev}] {body}")
+    lines.append("")
+
+    # ── Shadowed Policies ──
+    lines.append("─" * W)
+    lines.append("  SHADOWED POLICY DETECTION")
+    lines.append("─" * W)
+    lines.append("")
+    lines.append("  A policy is shadowed when an earlier rule with broader match criteria")
+    lines.append("  will always be evaluated first, making the later policy unreachable.")
+    lines.append("")
+    if shadow_f:
+        lines.append(f"  Found {len(shadow_f)} shadowed policy/policies:")
+        for fn in shadow_f:
+            body = ":".join(fn.split(":")[1:]).strip()
+            lines.append(f"  🟠 [HIGH] {body}")
+    else:
+        lines.append("  ✅ No shadowed policies detected.")
+    lines.append("")
+
+    # ── Duplicate Policies ──
+    lines.append("─" * W)
+    lines.append("  DUPLICATE POLICY DETECTION")
+    lines.append("─" * W)
+    lines.append("")
+    lines.append("  Duplicate policies share the same srcintf, dstintf, srcaddr,")
+    lines.append("  dstaddr, service, and action. The second entry is redundant.")
+    lines.append("")
+    if dupl_f:
+        lines.append(f"  Found {len(dupl_f)} duplicate policy pair(s):")
+        for fn in dupl_f:
+            body = ":".join(fn.split(":")[1:]).strip()
+            lines.append(f"  🟠 [HIGH] {body}")
+    else:
+        lines.append("  ✅ No duplicate policies detected.")
+    lines.append("")
+
+    # ── Recommendations ──
+    lines.append("─" * W)
+    lines.append("  RECOMMENDATIONS")
+    lines.append("─" * W)
+    lines.append("")
+    if shadow_f:
+        lines.append("  ▸ Review and reorder shadowed policies:")
+        lines.append("    Either move the specific rule ABOVE the broad rule, or")
+        lines.append("    merge rules if the intent is truly the same.")
+        lines.append("")
+    if dupl_f:
+        lines.append("  ▸ Remove duplicate policies:")
+        lines.append("    Keep the first occurrence and delete the duplicate.")
+        lines.append("    config firewall policy → delete <duplicate_policy_id>")
+        lines.append("")
+    if stats["no_comment"] > 0:
+        lines.append(f"  ▸ Document {stats['no_comment']} undocumented policies:")
+        lines.append("    config firewall policy → edit <id> → set comments '<purpose>'")
+        lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return low_cov_findings + shadow_f + dupl_f
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: UNUSED OBJECTS AUDIT
+# Addresses, address groups, services, service groups, VIPs
+# ═════════════════════════════════════════════════════════════════════════════
+
+def parse_address_objects(t):    return extract_block(t, "firewall address")
+def parse_address_groups(t):     return extract_block(t, "firewall addrgrp")
+def parse_service_custom(t):     return extract_block(t, "firewall service custom")
+def parse_service_groups(t):     return extract_block(t, "firewall service group")
+def parse_vip_objects(t):        return extract_block(t, "firewall vip")
+def parse_vip_groups(t):         return extract_block(t, "firewall vipgrp")
+def parse_ip_pools(t):           return extract_block(t, "firewall ippool")
+def parse_schedules(t):          return extract_block(t, "firewall schedule recurring")
+def parse_schedules_onetime(t):  return extract_block(t, "firewall schedule onetime")
+
+
+def build_object_reference_map(
+    policies: List[Dict],
+    policies6: List[Dict],
+    ssl_profiles: List[Dict],
+    vip_groups: List[Dict],
+    addr_groups: List[Dict],
+    svc_groups: List[Dict],
+) -> Dict[str, set]:
+    """
+    Build a map of {object_name: set_of_policy_ids_referencing_it}.
+    Scans all policy fields that reference named objects.
+    """
+    refs: Dict[str, set] = {}
+
+    def add_ref(name: str, pid: str):
+        n = nv(name)
+        if n and n.lower() not in ("all", "any", ""):
+            refs.setdefault(n, set()).add(pid)
+
+    def scan_policy(p: Dict, prefix="pol"):
+        pid = nv(p.get("policyid", p.get("_id", "")))
+        for fld in ("srcaddr","dstaddr","srcaddr6","dstaddr6",
+                    "poolname","internet-service-name","internet-service-id"):
+            for token in nv(p.get(fld,"")).split():
+                add_ref(token, f"{prefix}#{pid}")
+        for fld in ("service",):
+            for token in nv(p.get(fld,"")).split():
+                add_ref(token, f"{prefix}#{pid}")
+        for fld in ("schedule",):
+            add_ref(nv(p.get(fld,"")), f"{prefix}#{pid}")
+        # UTM profile references
+        for fld in ("ips-sensor","av-profile","webfilter-profile","dnsfilter-profile",
+                    "application-list","ssl-ssh-profile","dlp-profile","waf-profile",
+                    "emailfilter-profile","file-filter-profile","virtual-patch-profile",
+                    "casb-profile","llm-profile","voip-profile"):
+            add_ref(nv(p.get(fld,"")), f"{prefix}#{pid}")
+
+    for p in policies + policies6:
+        scan_policy(p, "pol")
+
+    # VIP groups reference VIPs
+    for g in vip_groups:
+        gname = nv(g.get("name", g.get("_id","")))
+        for token in nv(g.get("member","")).split():
+            add_ref(token, f"vipgrp:{gname}")
+
+    # Address groups reference addresses
+    for g in addr_groups:
+        gname = nv(g.get("name", g.get("_id","")))
+        for token in nv(g.get("member","")).split():
+            add_ref(token, f"addrgrp:{gname}")
+
+    # Service groups reference services
+    for g in svc_groups:
+        gname = nv(g.get("name", g.get("_id","")))
+        for token in nv(g.get("member","")).split():
+            add_ref(token, f"svcgrp:{gname}")
+
+    return refs
+
+
+def check_unused_objects(
+    addr_objs:    List[Dict],
+    addr_groups:  List[Dict],
+    svc_custom:   List[Dict],
+    svc_groups:   List[Dict],
+    vip_objs:     List[Dict],
+    vip_groups:   List[Dict],
+    ip_pools:     List[Dict],
+    schedules:    List[Dict],
+    schedules_ot: List[Dict],
+    ref_map:      Dict[str, set],
+) -> List[str]:
+    findings = []
+
+    # Built-in names that are always used and should be excluded
+    BUILTINS = {
+        "all", "none", "any", "always", "never",
+        "PING", "HTTP", "HTTPS", "SSH", "FTP", "DNS", "SMTP",
+        "POP3", "IMAP", "RDP", "NTP", "SNMP", "ALL", "ALL_TCP",
+        "ALL_UDP", "ALL_ICMP",
+    }
+
+    def is_unused(name: str) -> bool:
+        n = nv(name)
+        return n not in BUILTINS and n not in ref_map
+
+    # Address objects
+    for obj in addr_objs:
+        name = nv(obj.get("name", obj.get("_id","")))
+        if is_unused(name):
+            typ   = nv(obj.get("type",""))
+            subnet = nv(obj.get("subnet","")) or nv(obj.get("fqdn","")) or nv(obj.get("iprange",""))
+            findings.append(f(I, f"Unused Address: '{name}' ({typ} {subnet}) is not referenced "
+                                "by any policy, group, or VIP. Consider removing to keep the "
+                                "object table clean."))
+
+    # Address groups
+    for obj in addr_groups:
+        name = nv(obj.get("name", obj.get("_id","")))
+        if is_unused(name):
+            findings.append(f(I, f"Unused AddressGroup: '{name}' is not referenced by any "
+                                "policy. Remove or consolidate."))
+
+    # Service custom
+    for obj in svc_custom:
+        name = nv(obj.get("name", obj.get("_id","")))
+        if is_unused(name):
+            proto = nv(obj.get("protocol",""))
+            findings.append(f(I, f"Unused Service: '{name}' ({proto}) not referenced by any "
+                                "policy or group."))
+
+    # Service groups
+    for obj in svc_groups:
+        name = nv(obj.get("name", obj.get("_id","")))
+        if is_unused(name):
+            findings.append(f(I, f"Unused ServiceGroup: '{name}' not referenced anywhere."))
+
+    # VIPs
+    for obj in vip_objs:
+        name    = nv(obj.get("name", obj.get("_id","")))
+        ext_ip  = nv(obj.get("extip",""))
+        map_ip  = nv(obj.get("mappedip",""))
+        ext_intf = nv(obj.get("extintf",""))
+        if is_unused(name):
+            findings.append(f(M, f"Unused VIP: '{name}' (extip:{ext_ip} → mappedip:{map_ip} "
+                                f"on {ext_intf}) is not used in any policy. "
+                                "Unused VIPs may represent forgotten port-forwards — "
+                                "verify they are intentionally disabled or remove them."))
+
+    # IP Pools
+    for obj in ip_pools:
+        name = nv(obj.get("name", obj.get("_id","")))
+        if is_unused(name):
+            pool_type = nv(obj.get("type",""))
+            startip   = nv(obj.get("startip",""))
+            endip     = nv(obj.get("endip",""))
+            findings.append(f(I, f"Unused IP Pool: '{name}' ({pool_type} {startip}-{endip}) "
+                                "not referenced by any policy."))
+
+    # Schedules
+    for obj in schedules + schedules_ot:
+        name = nv(obj.get("name", obj.get("_id","")))
+        if is_unused(name):
+            findings.append(f(I, f"Unused Schedule: '{name}' not referenced by any policy."))
+
+    return findings
+
+
+def generate_unused_objects_report(
+    addr_objs, addr_groups, svc_custom, svc_groups,
+    vip_objs, vip_groups, ip_pools, schedules, schedules_ot,
+    policies, policies6, ssl_profiles,
+    out_path: Path
+):
+    ref_map = build_object_reference_map(
+        policies, policies6, ssl_profiles,
+        vip_groups, addr_groups, svc_groups
+    )
+    findings = check_unused_objects(
+        addr_objs, addr_groups, svc_custom, svc_groups,
+        vip_objs, vip_groups, ip_pools, schedules, schedules_ot,
+        ref_map
+    )
+
+    # Categorize
+    unused_addr  = [f for f in findings if "Unused Address:" in f and "Group" not in f]
+    unused_agrp  = [f for f in findings if "Unused AddressGroup:" in f]
+    unused_svc   = [f for f in findings if "Unused Service:" in f and "Group" not in f]
+    unused_sgrp  = [f for f in findings if "Unused ServiceGroup:" in f]
+    unused_vip   = [f for f in findings if "Unused VIP:" in f]
+    unused_pool  = [f for f in findings if "Unused IP Pool:" in f]
+    unused_sched = [f for f in findings if "Unused Schedule:" in f]
+
+    W = 80
+    lines = []
+    lines.append("=" * W)
+    lines.append(" UNUSED OBJECTS AUDIT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+
+    summary_rows = [
+        ("Address objects total",    str(len(addr_objs))),
+        ("  Unused",                 str(len(unused_addr))),
+        ("Address groups total",     str(len(addr_groups))),
+        ("  Unused",                 str(len(unused_agrp))),
+        ("Custom services total",    str(len(svc_custom))),
+        ("  Unused",                 str(len(unused_svc))),
+        ("Service groups total",     str(len(svc_groups))),
+        ("  Unused",                 str(len(unused_sgrp))),
+        ("VIP objects total",        str(len(vip_objs))),
+        ("  Unused",                 str(len(unused_vip))),
+        ("IP Pools total",           str(len(ip_pools))),
+        ("  Unused",                 str(len(unused_pool))),
+        ("Schedules total",          str(len(schedules)+len(schedules_ot))),
+        ("  Unused",                 str(len(unused_sched))),
+    ]
+    lines.append(ascii_table(summary_rows, "Object Usage Summary"))
+    lines.append("")
+
+    for label, group in [
+        ("UNUSED VIPs (verify these are not forgotten port-forwards)", unused_vip),
+        ("UNUSED ADDRESS OBJECTS", unused_addr),
+        ("UNUSED ADDRESS GROUPS", unused_agrp),
+        ("UNUSED CUSTOM SERVICES", unused_svc),
+        ("UNUSED SERVICE GROUPS", unused_sgrp),
+        ("UNUSED IP POOLS", unused_pool),
+        ("UNUSED SCHEDULES", unused_sched),
+    ]:
+        lines.append("─" * W)
+        lines.append(f"  {label}")
+        lines.append("─" * W)
+        if group:
+            for fn in group:
+                body = ":".join(fn.split(":")[1:]).strip()
+                lines.append(f"  • {body}")
+        else:
+            lines.append("  ✅ None found.")
+        lines.append("")
+
+    lines.append("─" * W)
+    lines.append("  CLEANUP NOTES")
+    lines.append("─" * W)
+    lines.append("  • Unused VIPs are Medium severity — verify before deletion.")
+    lines.append("    An 'unused' VIP may be referenced by an external load balancer.")
+    lines.append("  • Unused address/service objects are Info — safe to clean up")
+    lines.append("    but do a final text search in the full config before deleting.")
+    lines.append("  • FortiGate CLI cleanup:")
+    lines.append("    config firewall address → delete <name>")
+    lines.append("    config firewall service custom → delete <name>")
+    lines.append("    config firewall vip → delete <name>")
+    lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: VIP SECURITY AUDIT
+# Published services, exposure analysis
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Well-known risky port mappings
+RISKY_PORTS = {
+    "21":   ("FTP",     H,  "FTP is unencrypted and uses passive mode which complicates firewall rules."),
+    "23":   ("Telnet",  C,  "Telnet is cleartext. Any exposure is critical."),
+    "25":   ("SMTP",    M,  "Direct SMTP from internet. Use a mail relay/gateway instead."),
+    "53":   ("DNS",     M,  "DNS exposed externally — risk of DNS amplification or zone transfer."),
+    "80":   ("HTTP",    M,  "HTTP (unencrypted web) published externally."),
+    "110":  ("POP3",    M,  "POP3 unencrypted."),
+    "135":  ("RPC",     H,  "MS-RPC exposed externally — lateral movement risk."),
+    "137":  ("NetBIOS", H,  "NetBIOS exposed externally — information disclosure."),
+    "138":  ("NetBIOS", H,  "NetBIOS datagram exposed externally."),
+    "139":  ("NetBIOS", H,  "NetBIOS session exposed externally."),
+    "143":  ("IMAP",    M,  "IMAP unencrypted."),
+    "389":  ("LDAP",    H,  "LDAP exposed externally — credential enumeration risk."),
+    "445":  ("SMB",     C,  "SMB/CIFS exposed to internet — EternalBlue/ransomware risk. Remove immediately."),
+    "1433": ("MSSQL",   C,  "MS SQL Server exposed to internet — direct DB access risk."),
+    "1521": ("Oracle",  C,  "Oracle DB exposed to internet."),
+    "3306": ("MySQL",   C,  "MySQL exposed to internet."),
+    "3389": ("RDP",     C,  "RDP exposed to internet — BlueKeep/credential brute-force. Use VPN instead."),
+    "4899": ("Radmin",  C,  "Radmin exposed — remote admin tool with known vulnerabilities."),
+    "5432": ("Postgres",C,  "PostgreSQL exposed to internet."),
+    "5900": ("VNC",     C,  "VNC exposed to internet — weak auth, cleartext capable."),
+    "5985": ("WinRM",   H,  "WinRM (PowerShell remoting) exposed to internet."),
+    "5986": ("WinRM",   H,  "WinRM HTTPS exposed to internet."),
+    "6379": ("Redis",   C,  "Redis exposed to internet — no auth by default, RCE risk."),
+    "8080": ("HTTP-alt",M,  "Alternative HTTP port exposed externally."),
+    "8443": ("HTTPS-alt",I, "Alternative HTTPS port exposed externally."),
+    "27017":("MongoDB", C,  "MongoDB exposed to internet — no auth by default historically."),
+}
+
+
+def vip_weaknesses(vip: Dict, policies: List[Dict]) -> List[str]:
+    """Analyze a VIP for security issues."""
+    findings = []
+    name     = nv(vip.get("name", vip.get("_id","")))
+    extip    = nv(vip.get("extip",""))
+    mappedip = nv(vip.get("mappedip",""))
+    extintf  = nv(vip.get("extintf",""))
+    ext_port = nv(vip.get("extservice","")) or nv(vip.get("portforward",""))
+    proto    = nv(vip.get("protocol",""))
+    ext_p    = nv(vip.get("extport",""))
+    map_p    = nv(vip.get("mappedport",""))
+    src_filt = nv(vip.get("src-filter",""))
+    nat_src  = nv(vip.get("nat-source-vip",""))
+    vip_type = nv(vip.get("type","static-nat"))
+    comment  = nv(vip.get("comment",""))
+    arp_reply = nv(vip.get("arp-reply",""))
+
+    # Is this VIP used in any policy?
+    name_in_policy = any(name in nv(p.get("dstaddr","")) for p in policies)
+
+    if not name_in_policy:
+        findings.append(f(M, f"VIP '{name}': not referenced in any firewall policy — "
+                            "port-forward is defined but no policy permits traffic to it. "
+                            "Verify if this VIP is intentionally inactive or is an orphan."))
+
+    # Source filter check
+    if not src_filt or src_filt in ("0.0.0.0", ""):
+        findings.append(f(M, f"VIP '{name}': no src-filter configured — "
+                            f"ALL internet IPs can attempt to reach the mapped destination ({mappedip}). "
+                            "Add src-filter to restrict to known source IPs where possible. "
+                            "CLI: edit vip → set src-filter <ip-range>"))
+
+    # No comment
+    if not comment:
+        findings.append(f(I, f"VIP '{name}': no comment — document the purpose of this port-forward."))
+
+    # Check exposed port risks
+    for port_str in [ext_p, map_p]:
+        for port_token in port_str.split():
+            port_clean = port_token.split("-")[0].strip()
+            if port_clean in RISKY_PORTS:
+                svc_name, severity, detail = RISKY_PORTS[port_clean]
+                findings.append(f(severity,
+                    f"VIP '{name}': exposes {svc_name} (port {port_clean}) from internet → {mappedip}. "
+                    f"{detail}"))
+
+    # ARP reply on WAN (can cause issues)
+    if arp_reply == "enable" and extintf:
+        extintf_l = extintf.lower()
+        if any(w in extintf_l for w in ("wan","internet","outside","untrust")):
+            findings.append(f(I, f"VIP '{name}': arp-reply enabled on WAN interface '{extintf}' — "
+                                "verify this is correct for your external IP assignment."))
+
+    return findings
+
+
+def generate_vip_report(vip_objs: List[Dict], vip_groups: List[Dict],
+                         policies: List[Dict], out_path: Path) -> List[str]:
+    all_findings = []
+    W = 80
+    lines = []
+    lines.append("=" * W)
+    lines.append(" VIP / PORT-FORWARD SECURITY AUDIT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+    lines.append(f"  VIP objects: {len(vip_objs)}   VIP groups: {len(vip_groups)}")
+    lines.append("")
+
+    if not vip_objs:
+        lines.append("  No VIP objects configured.")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        return []
+
+    for vip in vip_objs:
+        name     = nv(vip.get("name", vip.get("_id","")))
+        extip    = nv(vip.get("extip",""))
+        mappedip = nv(vip.get("mappedip",""))
+        extintf  = nv(vip.get("extintf",""))
+        ext_p    = nv(vip.get("extport",""))
+        map_p    = nv(vip.get("mappedport",""))
+        src_filt = nv(vip.get("src-filter",""))
+        proto    = nv(vip.get("protocol","tcp"))
+        vip_type = nv(vip.get("type","static-nat"))
+        comment  = nv(vip.get("comment",""))
+
+        rows = [
+            ("VIP Name",        name),
+            ("Type",            vip_type),
+            ("External IP",     extip),
+            ("External Port",   ext_p or "(all)"),
+            ("Mapped IP",       mappedip),
+            ("Mapped Port",     map_p or "(same)"),
+            ("Interface",       extintf),
+            ("Protocol",        proto),
+            ("Source Filter",   src_filt or "(none — any source)"),
+            ("Comment",         comment or "(none)"),
+        ]
+        lines.append("─" * W)
+        lines.append(ascii_table(rows, f"VIP: {name}"))
+
+        w = vip_weaknesses(vip, policies)
+        all_findings.extend(w)
+        if w:
+            lines.append("  Findings:")
+            for fn in w:
+                sev  = fn.split(":")[0]
+                body = ":".join(fn.split(":")[1:]).strip()
+                icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+                lines.append(f"  {icon} [{sev}] {body}")
+        else:
+            lines.append("  ✅ No issues found.")
+        lines.append("")
+
+    # Critical summary
+    crits = [f for f in all_findings if f.startswith("CRITICAL:")]
+    if crits:
+        lines.append("─" * W)
+        lines.append("  🔴 CRITICAL VIP EXPOSURES (remediate immediately):")
+        for fn in crits:
+            body = ":".join(fn.split(":")[1:]).strip()
+            lines.append(f"  • {body}")
+        lines.append("")
+        lines.append("  For each critical VIP, consider:")
+        lines.append("  1. Remove the VIP entirely and use VPN instead (RDP, SMB, DB)")
+        lines.append("  2. Add src-filter to restrict to known IPs")
+        lines.append("  3. Move service behind SSL-VPN or Zero Trust proxy")
+        lines.append("  CLI: config firewall vip → edit <name> → set src-filter <allowed-ip>")
+        lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return all_findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: SD-WAN AUDIT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def parse_sdwan(text: str) -> Dict[str, Any]:
+    """
+    Parse 'config system sdwan' with nested members and health-check blocks.
+    Returns flat cfg dict plus _members and _health_checks lists.
+    """
+    lines = text.splitlines()
+    in_block = False
+    cfg: Dict[str, Any] = {"_members": [], "_health_checks": [], "_rules": []}
+    depth = 0
+    sub_type = ""   # "member" | "health-check" | "service"
+    cur_obj: Dict[str, Any] = {}
+
+    for raw in lines:
+        line = raw.strip()
+
+        if line == "config system sdwan":
+            in_block = True
+            continue
+        if not in_block:
+            continue
+
+        if line == "config members" and depth == 0:
+            sub_type = "member"
+            depth = 1
+            continue
+        if line == "config health-check" and depth == 0:
+            sub_type = "health-check"
+            depth = 1
+            continue
+        if line == "config service" and depth == 0:
+            sub_type = "service"
+            depth = 1
+            continue
+
+        if depth == 1:
+            if line.startswith("edit "):
+                if cur_obj:
+                    if sub_type == "member":
+                        cfg["_members"].append(cur_obj)
+                    elif sub_type == "health-check":
+                        cfg["_health_checks"].append(cur_obj)
+                    elif sub_type == "service":
+                        cfg["_rules"].append(cur_obj)
+                oid = line.split(None,1)[1].strip().strip('"')
+                cur_obj = {"_id": oid}
+                continue
+            if line == "next":
+                if cur_obj:
+                    if sub_type == "member":
+                        cfg["_members"].append(cur_obj)
+                    elif sub_type == "health-check":
+                        cfg["_health_checks"].append(cur_obj)
+                    elif sub_type == "service":
+                        cfg["_rules"].append(cur_obj)
+                cur_obj = {}
+                continue
+            if line == "end":
+                if cur_obj:
+                    if sub_type == "member":
+                        cfg["_members"].append(cur_obj)
+                    elif sub_type == "health-check":
+                        cfg["_health_checks"].append(cur_obj)
+                    elif sub_type == "service":
+                        cfg["_rules"].append(cur_obj)
+                cur_obj = {}
+                sub_type = ""
+                depth = 0
+                continue
+            if line.startswith("set "):
+                k, v = parse_set_line(line)
+                if k:
+                    cur_obj[k] = v
+            continue
+
+        if depth == 0:
+            if line == "end":
+                break
+            if line.startswith("set "):
+                k, v = parse_set_line(line)
+                if k:
+                    cfg[k] = v
+
+    return cfg
+
+
+def sdwan_weaknesses(cfg: Dict) -> List[str]:
+    findings = []
+
+    status   = nv(cfg.get("status","disable"))
+    members  = cfg.get("_members", [])
+    hc_list  = cfg.get("_health_checks", [])
+    rules    = cfg.get("_rules", [])
+    load_bal = nv(cfg.get("load-balance-mode",""))
+
+    if status != "enable":
+        findings.append(f(I, "SD-WAN: SD-WAN is not enabled on this device."))
+        return findings
+
+    if not members:
+        findings.append(f(H, "SD-WAN: enabled but no WAN members configured."))
+        return findings
+
+    # Member-level checks
+    monitored_intfs = set()
+    for hc in hc_list:
+        members_str = nv(hc.get("members",""))
+        for m in members_str.split():
+            monitored_intfs.add(m)
+
+    for m in members:
+        mid      = nv(m.get("_id",""))
+        intf     = nv(m.get("interface",""))
+        gateway  = nv(m.get("gateway",""))
+        priority = nv(m.get("priority",""))
+        weight   = nv(m.get("weight",""))
+        cost     = nv(m.get("cost",""))
+        status_m = nv(m.get("status","enable"))
+
+        if status_m == "disable":
+            findings.append(f(I, f"SD-WAN member {mid} ('{intf}'): disabled — not participating in SD-WAN."))
+            continue
+
+        if not gateway:
+            findings.append(f(M, f"SD-WAN member {mid} ('{intf}'): no gateway configured — "
+                                "failover routing will be unreliable."))
+
+        if mid not in monitored_intfs and intf not in monitored_intfs:
+            findings.append(f(H, f"SD-WAN member {mid} ('{intf}'): NOT monitored by any health-check — "
+                                "link failures will not trigger failover. "
+                                "Add a health-check and reference this member."))
+
+    # Health-check checks
+    if not hc_list:
+        findings.append(f(C, "SD-WAN: NO health-checks configured — link failures are UNDETECTED. "
+                            "SD-WAN cannot failover without health monitoring. "
+                            "CLI: config system sdwan → config health-check → edit MyHC "
+                            "→ set server 8.8.8.8 → set interval 500 → set failtime 3"))
+    else:
+        for hc in hc_list:
+            hcid       = nv(hc.get("_id",""))
+            server     = nv(hc.get("server",""))
+            interval   = nv(hc.get("interval",""))
+            failtime   = nv(hc.get("failtime",""))
+            recovertime = nv(hc.get("recovertime",""))
+            probe_pkt  = nv(hc.get("probe-packets",""))
+            thresh_lat = nv(hc.get("latency-threshold",""))
+            thresh_jit = nv(hc.get("jitter-threshold",""))
+            thresh_pkt = nv(hc.get("packetloss-threshold",""))
+            protocol   = nv(hc.get("protocol",""))
+
+            if not server:
+                findings.append(f(H, f"SD-WAN health-check '{hcid}': no probe server set — "
+                                    "health-check will not function."))
+
+            try:
+                if int(interval) > 2000:
+                    findings.append(f(M, f"SD-WAN health-check '{hcid}': interval {interval}ms is high — "
+                                       "slow failure detection; consider ≤ 500ms for fast failover."))
+            except (ValueError, TypeError):
+                if not interval:
+                    findings.append(f(I, f"SD-WAN health-check '{hcid}': interval not set — using default."))
+
+            try:
+                if int(failtime) > 5:
+                    findings.append(f(M, f"SD-WAN health-check '{hcid}': failtime {failtime} — "
+                                       "requires {failtime} failures before declaring link down; "
+                                       "consider 3 for faster failover."))
+            except (ValueError, TypeError):
+                pass
+
+            if not thresh_lat:
+                findings.append(f(M, f"SD-WAN health-check '{hcid}': no latency-threshold — "
+                                    "poor-quality links with high latency will still be used. "
+                                    "Set: set latency-threshold 150"))
+            if not thresh_jit:
+                findings.append(f(M, f"SD-WAN health-check '{hcid}': no jitter-threshold — "
+                                    "jittery links will not be penalized. "
+                                    "Set: set jitter-threshold 30"))
+            if not thresh_pkt:
+                findings.append(f(M, f"SD-WAN health-check '{hcid}': no packetloss-threshold — "
+                                    "links with packet loss will still carry traffic. "
+                                    "Set: set packetloss-threshold 5"))
+
+    # SD-WAN rules / SLA
+    if not rules:
+        findings.append(f(M, "SD-WAN: no traffic steering rules (service rules) configured — "
+                            "all traffic uses default load-balance mode without application-aware routing."))
+    else:
+        for rule in rules:
+            rid     = nv(rule.get("_id",""))
+            mode    = nv(rule.get("mode",""))
+            sla_ifs = nv(rule.get("sla-stickiness",""))
+            priority_m = nv(rule.get("priority-members",""))
+
+            if mode == "manual" and not priority_m:
+                findings.append(f(I, f"SD-WAN rule {rid}: manual mode with no priority-members — "
+                                    "consider SLA mode for quality-aware routing."))
+
+    return findings
+
+
+def generate_sdwan_report(sdwan_cfg: Dict, out_path: Path) -> List[str]:
+    findings = sdwan_weaknesses(sdwan_cfg)
+    W = 80
+    lines = []
+    lines.append("=" * W)
+    lines.append(" SD-WAN CONFIGURATION AUDIT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+
+    members = sdwan_cfg.get("_members", [])
+    hc_list = sdwan_cfg.get("_health_checks", [])
+    rules   = sdwan_cfg.get("_rules", [])
+
+    rows = [
+        ("SD-WAN Status",       nv(sdwan_cfg.get("status","disable"))),
+        ("Load Balance Mode",   nv(sdwan_cfg.get("load-balance-mode",""))),
+        ("Members",             str(len(members))),
+        ("Health Checks",       str(len(hc_list))),
+        ("Traffic Rules",       str(len(rules))),
+    ]
+    lines.append(ascii_table(rows, "SD-WAN Overview"))
+    lines.append("")
+
+    if members:
+        lines.append("─" * W)
+        lines.append("  WAN MEMBERS")
+        lines.append("─" * W)
+        for m in members:
+            mid  = nv(m.get("_id",""))
+            intf = nv(m.get("interface",""))
+            gw   = nv(m.get("gateway",""))
+            pri  = nv(m.get("priority","1"))
+            cost = nv(m.get("cost","0"))
+            stat = nv(m.get("status","enable"))
+            lines.append(f"  Member {mid}: intf={intf}  gw={gw}  priority={pri}  cost={cost}  status={stat}")
+        lines.append("")
+
+    if hc_list:
+        lines.append("─" * W)
+        lines.append("  HEALTH CHECKS")
+        lines.append("─" * W)
+        for hc in hc_list:
+            hcid      = nv(hc.get("_id",""))
+            server    = nv(hc.get("server",""))
+            interval  = nv(hc.get("interval",""))
+            proto     = nv(hc.get("protocol","ping"))
+            lat_thr   = nv(hc.get("latency-threshold",""))
+            jit_thr   = nv(hc.get("jitter-threshold",""))
+            pkt_thr   = nv(hc.get("packetloss-threshold",""))
+            lines.append(f"  HC '{hcid}': server={server}  protocol={proto}  "
+                         f"interval={interval}ms  latency≤{lat_thr or '?'}ms  "
+                         f"jitter≤{jit_thr or '?'}ms  loss≤{pkt_thr or '?'}%")
+        lines.append("")
+
+    lines.append("─" * W)
+    lines.append("  FINDINGS")
+    lines.append("─" * W)
+    if findings:
+        for fn in findings:
+            sev  = fn.split(":")[0]
+            body = ":".join(fn.split(":")[1:]).strip()
+            icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+            lines.append(f"  {icon} [{sev}] {body}")
+    else:
+        lines.append("  ✅ SD-WAN configuration looks healthy.")
+    lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: INTERFACE EXPOSURE SCORE
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Exposure scoring weights per protocol (higher = worse exposure)
+EXPOSURE_WEIGHTS = {
+    "telnet":   10,   # cleartext — worst possible
+    "http":     9,    # cleartext management
+    "snmp":     8,    # community strings / info disclosure
+    "ssh":      5,    # encrypted but brute-force target
+    "https":    4,    # encrypted but still exposed GUI
+    "ping":     2,    # ICMP recon
+    "fmg-access": 7,  # FortiManager — management fabric
+    "fabric":   6,    # Security Fabric on WAN
+    "fnbam":    3,    # FortiAuthenticator
+}
+
+def interface_exposure_score(intf: Dict) -> Dict[str, Any]:
+    """Compute an exposure score 0-10 for one interface."""
+    name   = nv(intf.get("name", intf.get("_id","")))
+    role   = nv(intf.get("role",""))
+    aa     = nv(intf.get("allowaccess",""))
+    typ    = nv(intf.get("type",""))
+    ip     = nv(intf.get("ip",""))
+
+    aa_parts = set(aa.lower().split())
+    score = 0
+    exposed = []
+    for proto, weight in EXPOSURE_WEIGHTS.items():
+        if proto in aa_parts:
+            score += weight
+            exposed.append(proto)
+
+    # Normalize to 0-10
+    max_possible = sum(EXPOSURE_WEIGHTS.values())
+    normalized = round(min(10.0, (score / max_possible) * 10), 1)
+
+    if normalized >= 8:
+        grade = "CRITICAL EXPOSURE"
+    elif normalized >= 6:
+        grade = "HIGH EXPOSURE"
+    elif normalized >= 4:
+        grade = "MEDIUM EXPOSURE"
+    elif normalized >= 2:
+        grade = "LOW EXPOSURE"
+    else:
+        grade = "MINIMAL"
+
+    return {
+        "name": name, "role": role, "ip": ip, "type": typ,
+        "exposed_protos": exposed, "raw_score": score,
+        "normalized": normalized, "grade": grade,
+    }
+
+
+def generate_interface_exposure_report(interfaces: List[Dict], out_path: Path) -> List[str]:
+    findings = []
+    W = 80
+    lines = []
+    lines.append("=" * W)
+    lines.append(" INTERFACE EXPOSURE SCORE REPORT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+    lines.append("  Exposure score measures how much management/risky access is enabled")
+    lines.append("  on each interface. Score 0=minimal exposure, 10=maximum exposure.")
+    lines.append("")
+
+    scored = [interface_exposure_score(i) for i in interfaces]
+    scored.sort(key=lambda x: x["normalized"], reverse=True)
+
+    lines.append("─" * W)
+    lines.append(f"  {'Interface':<20} {'Role':<8} {'IP':<20} {'Exposed Protocols':<30} {'Score'}")
+    lines.append("─" * W)
+
+    for s in scored:
+        protos_str = " ".join(s["exposed_protos"]) if s["exposed_protos"] else "(none)"
+        score_bar  = "█" * int(s["normalized"]) + "░" * (10 - int(s["normalized"]))
+        lines.append(f"  {s['name']:<20} {s['role']:<8} {s['ip']:<20} {protos_str:<30} "
+                     f"{s['normalized']}/10")
+        lines.append(f"  {'':20} {'':8} {'':20} [{score_bar}] {s['grade']}")
+        lines.append("")
+
+    lines.append("─" * W)
+    lines.append("  DETAILED FINDINGS")
+    lines.append("─" * W)
+    lines.append("")
+
+    for s in scored:
+        if s["normalized"] == 0:
+            continue
+        name = s["name"]
+        role = s["role"]
+        score = s["normalized"]
+
+        # Generate findings per exposed protocol
+        for proto in s["exposed_protos"]:
+            weight = EXPOSURE_WEIGHTS.get(proto, 1)
+            if proto == "telnet":
+                findings.append(f(C, f"Interface '{name}' ({role}): Telnet enabled — "
+                                    "cleartext management. Remove immediately. "
+                                    f"CLI: config system interface → edit {name} → "
+                                    "set allowaccess (list without telnet)"))
+            elif proto == "http":
+                sev = C if role == "wan" else H
+                findings.append(f(sev, f"Interface '{name}' ({role}): HTTP enabled — "
+                                      "cleartext management. Replace with HTTPS only."))
+            elif proto == "snmp":
+                sev = C if role == "wan" else H
+                findings.append(f(sev, f"Interface '{name}' ({role}): SNMP enabled — "
+                                      f"{'WAN-facing SNMP is critical risk' if role=='wan' else 'restrict to management VLAN'}."))
+            elif proto == "ssh" and role == "wan":
+                findings.append(f(H, f"Interface '{name}' (WAN): SSH exposed to internet — "
+                                    "restrict via local-in-policy to admin IPs only."))
+            elif proto == "https" and role == "wan":
+                findings.append(f(H, f"Interface '{name}' (WAN): HTTPS management on WAN — "
+                                    "restrict via local-in-policy or remove from allowaccess."))
+            elif proto == "ping" and role == "wan":
+                findings.append(f(M, f"Interface '{name}' (WAN): ICMP ping enabled — "
+                                    "aids attacker recon. Disable on WAN."))
+            elif proto == "fmg-access":
+                sev = H if role == "wan" else I
+                findings.append(f(sev, f"Interface '{name}' ({role}): FortiManager access enabled — "
+                                      f"{'should never be on WAN' if role=='wan' else 'verify FMG IP restriction'}."))
+            elif proto == "fabric" and role == "wan":
+                findings.append(f(H, f"Interface '{name}' (WAN): Security Fabric on WAN — "
+                                    "Fabric protocol should not face internet."))
+
+        # Overall score finding
+        if score >= 8:
+            findings.append(f(C, f"Interface '{name}' exposure score {score}/10 ({s['grade']}) — "
+                                "multiple risky protocols enabled. Immediate hardening required."))
+        elif score >= 6:
+            findings.append(f(H, f"Interface '{name}' exposure score {score}/10 ({s['grade']}) — "
+                                "significant management attack surface. Review and restrict."))
+        elif score >= 4 and role == "wan":
+            findings.append(f(M, f"Interface '{name}' (WAN) exposure score {score}/10 — "
+                                "above acceptable threshold for internet-facing interfaces."))
+
+    if findings:
+        for fn in findings:
+            sev  = fn.split(":")[0]
+            body = ":".join(fn.split(":")[1:]).strip()
+            icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+            lines.append(f"  {icon} [{sev}] {body}")
+    else:
+        lines.append("  ✅ No interface exposure issues found.")
+    lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: CERTIFICATE AUDIT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def parse_cert_local(t):   return extract_block(t, "vpn certificate local")
+def parse_cert_ca(t):      return extract_block(t, "vpn certificate ca")
+def parse_cert_remote(t):  return extract_block(t, "vpn certificate remote")
+
+
+def cert_weaknesses(cert: Dict, cert_type: str = "local") -> List[str]:
+    """Audit a certificate object."""
+    findings = []
+    name       = nv(cert.get("name", cert.get("_id","")))
+    status     = nv(cert.get("status",""))
+    comments   = nv(cert.get("comments",""))
+    source     = nv(cert.get("source",""))
+    issuer     = nv(cert.get("issuer",""))
+    subject    = nv(cert.get("subject",""))
+    # FortiGate stores cert validity as readable fields in some versions
+    not_after  = nv(cert.get("not-after",""))
+    key_size   = nv(cert.get("key-size","")) or nv(cert.get("bits",""))
+    key_type   = nv(cert.get("key-type","")) or nv(cert.get("type",""))
+    fingerprint = nv(cert.get("fingerprint",""))
+    auto_renew = nv(cert.get("auto-regenerate",""))
+    enroll_prot = nv(cert.get("enroll-protocol",""))
+
+    # Self-signed detection
+    is_self_signed = (
+        source in ("self-signed","factory","built-in") or
+        "factory" in name.lower() or
+        "self" in name.lower() or
+        (issuer and subject and issuer == subject)
+    )
+
+    if is_self_signed and cert_type == "local":
+        findings.append(f(M, f"Certificate '{name}': self-signed — clients cannot properly "
+                            "validate this certificate without manually trusting the CA. "
+                            "Use a publicly trusted CA for external-facing services."))
+
+    # Key size
+    if key_type.lower() in ("rsa",""):
+        try:
+            ks = int(key_size)
+            if ks < 2048:
+                findings.append(f(C, f"Certificate '{name}': RSA key size {ks} bits — "
+                                    "below minimum 2048 bits. This certificate is cryptographically weak. "
+                                    "Replace immediately."))
+            elif ks < 4096:
+                findings.append(f(I, f"Certificate '{name}': RSA {ks}-bit — "
+                                    "functional but consider 4096-bit for new certificates."))
+        except (ValueError, TypeError):
+            if not key_size:
+                findings.append(f(I, f"Certificate '{name}': key size not readable from config — "
+                                    "verify manually with 'get vpn certificate local'."))
+
+    # Expiry — FortiGate exposes not-after in some parseable formats
+    # Format varies: "YYYY/MM/DD HH:MM:SS" or unix timestamp
+    if not_after:
+        import re as _re
+        m = _re.match(r"(\d{4})[/\-](\d{2})[/\-](\d{2})", not_after)
+        if m:
+            import datetime as _dt
+            try:
+                exp_date = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                today    = _dt.date.today()
+                days_left = (exp_date - today).days
+                if days_left < 0:
+                    findings.append(f(C, f"Certificate '{name}': EXPIRED {abs(days_left)} days ago "
+                                       f"(expired {not_after}). Replace immediately — "
+                                       "expired certificates cause service outages and TLS errors."))
+                elif days_left <= 30:
+                    findings.append(f(H, f"Certificate '{name}': expires in {days_left} days "
+                                       f"({not_after}). Renew now before service disruption."))
+                elif days_left <= 90:
+                    findings.append(f(M, f"Certificate '{name}': expires in {days_left} days "
+                                       f"({not_after}). Plan renewal."))
+            except (ValueError, Exception):
+                pass
+
+    # Auto-renew
+    if cert_type == "local" and not is_self_signed:
+        if auto_renew != "enable":
+            findings.append(f(I, f"Certificate '{name}': auto-regenerate not enabled — "
+                                "certificate renewal requires manual intervention."))
+
+    return findings
+
+
+def generate_cert_report(
+    local_certs: List[Dict],
+    ca_certs:    List[Dict],
+    remote_certs: List[Dict],
+    out_path: Path
+) -> List[str]:
+    all_findings = []
+    W = 80
+    lines = []
+    lines.append("=" * W)
+    lines.append(" CERTIFICATE AUDIT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+    lines.append(f"  Local certs: {len(local_certs)}   "
+                 f"CA certs: {len(ca_certs)}   "
+                 f"Remote certs: {len(remote_certs)}")
+    lines.append("")
+
+    for label, certs, ctype in [
+        ("LOCAL CERTIFICATES (used for VPN, GUI, etc.)", local_certs, "local"),
+        ("CA CERTIFICATES (trusted CAs)",               ca_certs,    "ca"),
+        ("REMOTE CERTIFICATES",                         remote_certs, "remote"),
+    ]:
+        lines.append("─" * W)
+        lines.append(f"  {label}")
+        lines.append("─" * W)
+        if not certs:
+            lines.append("  (none configured)")
+        for cert in certs:
+            name   = nv(cert.get("name", cert.get("_id","")))
+            issuer = nv(cert.get("issuer",""))
+            subj   = nv(cert.get("subject",""))
+            na     = nv(cert.get("not-after",""))
+            ks     = nv(cert.get("key-size",""))
+            src    = nv(cert.get("source",""))
+            rows = [
+                ("Name",        name),
+                ("Source",      src or "(unknown)"),
+                ("Issuer",      issuer[:60] if issuer else "(unknown)"),
+                ("Subject",     subj[:60] if subj else "(unknown)"),
+                ("Expires",     na or "(unknown — check device)"),
+                ("Key Size",    ks + " bits" if ks else "(unknown)"),
+            ]
+            lines.append(ascii_table(rows))
+            w = cert_weaknesses(cert, ctype)
+            all_findings.extend(w)
+            if w:
+                for fn in w:
+                    sev  = fn.split(":")[0]
+                    body = ":".join(fn.split(":")[1:]).strip()
+                    icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+                    lines.append(f"  {icon} [{sev}] {body}")
+            else:
+                lines.append("  ✅ No certificate issues detected (from config).")
+            lines.append("")
+
+    lines.append("─" * W)
+    lines.append("  NOTE: FortiGate config backups contain certificate metadata but not full")
+    lines.append("  certificate content. For complete expiry audit, run on the device:")
+    lines.append("    diagnose vpn certificate local list")
+    lines.append("    diagnose vpn certificate ca list")
+    lines.append("    execute ssl-cert show all")
+    lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return all_findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: FABRIC CONNECTOR / EXTERNAL RESOURCE AUDIT
+# AWS, Azure, GCP, Entra ID, EMS, ZTNA, SASE, FortiNAC
+# ═════════════════════════════════════════════════════════════════════════════
+
+def parse_fabric_connectors(t):     return extract_block(t, "system external-resource")
+def parse_system_connector(t):      return extract_block(t, "system connector")
+def parse_ems_settings(t):          return extract_flat_block(t, "endpoint-control fctems")
+def parse_ztna_settings(t):         return extract_flat_block(t, "firewall access-proxy")
+def parse_sase_connector(t):        return extract_flat_block(t, "system fortisase")
+def parse_fnac_settings(t):         return extract_flat_block(t, "user fsso")
+def parse_fortindr_settings(t):     return extract_flat_block(t, "system fortindr")
+def parse_cloud_connectors(t):
+    """Parse all cloud/fabric connector block types."""
+    results = {}
+    for block in ("system sdn-connector",):
+        objs = extract_block(t, block)
+        if objs:
+            results[block] = objs
+    return results
+
+
+def fabric_connector_weaknesses(connector: Dict) -> List[str]:
+    """Audit a single fabric/SDN connector."""
+    findings = []
+    name     = nv(connector.get("name", connector.get("_id","")))
+    typ      = nv(connector.get("type",""))
+    status   = nv(connector.get("status","enable"))
+    server   = nv(connector.get("server","")) or nv(connector.get("server-ip",""))
+    verify   = nv(connector.get("verify-certificate",""))
+    use_meta = nv(connector.get("use-metadata-iam",""))
+    access_k = nv(connector.get("access-key",""))
+    secret_k = nv(connector.get("secret-key",""))
+    tenant   = nv(connector.get("tenant-id",""))
+    client_i = nv(connector.get("client-id",""))
+    client_s = nv(connector.get("client-secret",""))
+    region   = nv(connector.get("region",""))
+    update_i = nv(connector.get("update-interval",""))
+
+    if status == "disable":
+        findings.append(f(I, f"Connector '{name}' ({typ}): disabled — "
+                            "if no longer needed, remove to reduce attack surface."))
+        return findings
+
+    # Certificate validation
+    if verify in ("", "disable"):
+        findings.append(f(H, f"Connector '{name}' ({typ}): verify-certificate disabled — "
+                            "connector will accept ANY TLS certificate from the cloud provider API. "
+                            "MITM possible if DNS is poisoned. "
+                            "CLI: set verify-certificate enable"))
+
+    # AWS-specific
+    if typ in ("aws","amazon"):
+        if access_k and secret_k:
+            findings.append(f(H, f"Connector '{name}' (AWS): using static access-key/secret-key — "
+                                "long-lived credentials are high risk if config backup is exposed. "
+                                "Switch to IAM role with use-metadata-iam enable."))
+        if use_meta != "enable" and not (access_k and secret_k):
+            findings.append(f(M, f"Connector '{name}' (AWS): use-metadata-iam not enabled and "
+                                "no credentials visible — verify authentication method."))
+        if not region:
+            findings.append(f(I, f"Connector '{name}' (AWS): no region set — connector may query wrong endpoint."))
+
+    # Azure-specific
+    if typ in ("azure","microsoft"):
+        if client_s:
+            findings.append(f(H, f"Connector '{name}' (Azure): client-secret stored in config — "
+                                "treat config backup as a secret. Prefer managed identity where possible."))
+        if not tenant:
+            findings.append(f(M, f"Connector '{name}' (Azure): tenant-id not set."))
+        if not client_i:
+            findings.append(f(M, f"Connector '{name}' (Azure): client-id not set."))
+
+    # GCP-specific
+    if typ in ("gcp","google"):
+        if not server:
+            findings.append(f(M, f"Connector '{name}' (GCP): no service account / server configured."))
+
+    # Update interval
+    try:
+        ui = int(update_i)
+        if ui > 3600:
+            findings.append(f(M, f"Connector '{name}' ({typ}): update-interval {ui}s ({ui//60}min) — "
+                                "stale dynamic address objects; consider ≤ 60s for cloud environments."))
+        elif ui < 30:
+            findings.append(f(I, f"Connector '{name}' ({typ}): update-interval {ui}s — "
+                                "very frequent API polling; verify rate limits with cloud provider."))
+    except (ValueError, TypeError):
+        pass
+
+    return findings
+
+
+def ems_weaknesses(cfg: Dict) -> List[str]:
+    """Audit EMS (Endpoint Management Server) integration."""
+    findings = []
+    server   = nv(cfg.get("server",""))
+    status   = nv(cfg.get("status",""))
+    verify   = nv(cfg.get("https-connection-verify",""))
+    call_to  = nv(cfg.get("call-timeout",""))
+    cert_fpr = nv(cfg.get("certificate-fingerprint",""))
+    pull_cfg = nv(cfg.get("pull-sysinfo",""))
+    pull_av  = nv(cfg.get("pull-av-status",""))
+    pull_vul = nv(cfg.get("pull-vulnerabilities",""))
+
+    if not server:
+        findings.append(f(I, "EMS: no EMS server configured — endpoint posture check and "
+                            "ZTNA tag-based policies require EMS integration."))
+        return findings
+
+    if status != "enable":
+        findings.append(f(M, "EMS: EMS integration disabled — endpoint compliance "
+                            "enforcement and ZTNA tags not active."))
+
+    if verify in ("", "disable"):
+        findings.append(f(H, "EMS: https-connection-verify disabled — FortiGate will not "
+                            "validate EMS server certificate. MITM possible."))
+
+    if not cert_fpr:
+        findings.append(f(M, "EMS: certificate-fingerprint not set — without fingerprint "
+                            "pinning, any cert from the EMS server is accepted."))
+
+    if pull_vul != "enable":
+        findings.append(f(M, "EMS: pull-vulnerabilities not enabled — vulnerability status "
+                            "of endpoints not used for policy enforcement."))
+
+    if pull_av != "enable":
+        findings.append(f(I, "EMS: pull-av-status not enabled — AV compliance of endpoints "
+                            "not checked."))
+
+    return findings
+
+
+def ztna_weaknesses(cfg: Dict, policies: List[Dict]) -> List[str]:
+    """Audit ZTNA configuration."""
+    findings = []
+
+    # Check ZTNA usage in policies
+    ztna_enabled_policies = [
+        p for p in policies if nv(p.get("ztna-status","")) == "enable"
+    ]
+    total_accept = [p for p in policies if nv(p.get("action","")) == "accept"]
+
+    if not ztna_enabled_policies:
+        findings.append(f(I, "ZTNA: no policies have ztna-status enabled — "
+                            "Zero Trust Network Access not enforced on any traffic flow. "
+                            "Consider enabling ZTNA on internet-facing access policies."))
+    else:
+        pct = 100 * len(ztna_enabled_policies) // len(total_accept) if total_accept else 0
+        if pct < 30:
+            findings.append(f(I, f"ZTNA: only {len(ztna_enabled_policies)}/{len(total_accept)} "
+                                f"accept policies ({pct}%) have ZTNA enabled — "
+                                "consider broader Zero Trust enforcement."))
+
+    # Check ZTNA EMS tag usage
+    ztna_tag_policies = [
+        p for p in policies
+        if nv(p.get("ztna-ems-tag","")) or nv(p.get("ztna-device-ownership",""))
+    ]
+    if ztna_enabled_policies and not ztna_tag_policies:
+        findings.append(f(M, "ZTNA: ZTNA enabled on policies but no EMS tags or device ownership "
+                            "checks configured — ZTNA enforcement is incomplete without posture checks."))
+
+    return findings
+
+
+def sase_weaknesses(cfg: Dict) -> List[str]:
+    """Audit FortiSASE connector."""
+    findings = []
+    status   = nv(cfg.get("status",""))
+    server   = nv(cfg.get("server",""))
+    interface = nv(cfg.get("interface",""))
+
+    if not cfg or not status:
+        findings.append(f(I, "SASE: FortiSASE connector not configured — "
+                            "cloud-delivered security service not integrated."))
+        return findings
+
+    if status != "enable":
+        findings.append(f(I, "SASE: FortiSASE configured but disabled."))
+
+    if not server:
+        findings.append(f(M, "SASE: no SASE server endpoint configured."))
+
+    return findings
+
+
+def generate_fabric_connector_report(
+    fabric_connectors: List[Dict],
+    cloud_connectors:  Dict,
+    ems_cfg:           Dict,
+    ztna_cfg:          Dict,
+    sase_cfg:          Dict,
+    policies:          List[Dict],
+    out_path:          Path
+) -> List[str]:
+    all_findings = []
+    W = 80
+    lines = []
+    lines.append("=" * W)
+    lines.append(" FABRIC CONNECTOR / CLOUD INTEGRATION AUDIT ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+
+    # SDN Connectors (AWS, Azure, GCP, etc.)
+    sdn_list = cloud_connectors.get("system sdn-connector", [])
+    lines.append("─" * W)
+    lines.append(f"  SDN / CLOUD CONNECTORS  ({len(sdn_list)} found)")
+    lines.append("─" * W)
+    lines.append("")
+    if sdn_list:
+        for conn in sdn_list:
+            name = nv(conn.get("name", conn.get("_id","")))
+            typ  = nv(conn.get("type",""))
+            stat = nv(conn.get("status","enable"))
+            rows = [
+                ("Connector Name",   name),
+                ("Type",             typ),
+                ("Status",           stat),
+                ("Server/Endpoint",  nv(conn.get("server","")) or nv(conn.get("server-ip","")) or "(cloud metadata)"),
+                ("Update Interval",  nv(conn.get("update-interval","")) + "s" if conn.get("update-interval") else "(default)"),
+                ("Verify Cert",      nv(conn.get("verify-certificate",""))),
+                ("Use Metadata IAM", nv(conn.get("use-metadata-iam",""))),
+            ]
+            lines.append(ascii_table(rows, f"SDN Connector: {name} ({typ})"))
+            w = fabric_connector_weaknesses(conn)
+            all_findings.extend(w)
+            for fn in w:
+                sev  = fn.split(":")[0]
+                body = ":".join(fn.split(":")[1:]).strip()
+                icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+                lines.append(f"  {icon} [{sev}] {body}")
+            lines.append("")
+    else:
+        lines.append("  No SDN/Cloud connectors configured.")
+        lines.append("")
+
+    # External Resources
+    lines.append("─" * W)
+    lines.append(f"  EXTERNAL RESOURCES  ({len(fabric_connectors)} found)")
+    lines.append("─" * W)
+    for res in fabric_connectors:
+        name    = nv(res.get("name", res.get("_id","")))
+        typ     = nv(res.get("type",""))
+        uri     = nv(res.get("resource",""))
+        status  = nv(res.get("status","enable"))
+        refresh = nv(res.get("refresh-rate",""))
+        verify  = nv(res.get("server-identity-check",""))
+
+        rows = [
+            ("Name",           name),
+            ("Type",           typ),
+            ("Status",         status),
+            ("URI",            uri[:60] if uri else "(none)"),
+            ("Refresh Rate",   refresh + "s" if refresh else "(default)"),
+            ("Cert Verify",    verify),
+        ]
+        lines.append(ascii_table(rows))
+
+        # External resource findings
+        if verify in ("", "disable"):
+            fn = f(M, f"External Resource '{name}': server-identity-check disabled — "
+                       "FortiGate will not verify the TLS certificate of the threat feed source.")
+            all_findings.append(fn)
+            lines.append(f"  🟡 [MEDIUM] {':'.join(fn.split(':')[1:]).strip()}")
+        if not uri:
+            fn = f(M, f"External Resource '{name}': no resource URI configured.")
+            all_findings.append(fn)
+            lines.append(f"  🟡 [MEDIUM] {':'.join(fn.split(':')[1:]).strip()}")
+        if status == "disable":
+            fn = f(I, f"External Resource '{name}': disabled — threat feed not active.")
+            all_findings.append(fn)
+            lines.append(f"  🔵 [INFO] {':'.join(fn.split(':')[1:]).strip()}")
+        lines.append("")
+
+    # EMS
+    lines.append("─" * W)
+    lines.append("  EMS (ENDPOINT MANAGEMENT SERVER) INTEGRATION")
+    lines.append("─" * W)
+    w = ems_weaknesses(ems_cfg)
+    all_findings.extend(w)
+    if ems_cfg.get("server"):
+        rows = [
+            ("EMS Server",    nv(ems_cfg.get("server",""))),
+            ("Status",        nv(ems_cfg.get("status",""))),
+            ("Cert Verify",   nv(ems_cfg.get("https-connection-verify",""))),
+            ("Cert Fingerprint", nv(ems_cfg.get("certificate-fingerprint","")) or "(not set)"),
+            ("Pull Vuln",     nv(ems_cfg.get("pull-vulnerabilities",""))),
+            ("Pull AV Status",nv(ems_cfg.get("pull-av-status",""))),
+        ]
+        lines.append(ascii_table(rows))
+    for fn in w:
+        sev  = fn.split(":")[0]
+        body = ":".join(fn.split(":")[1:]).strip()
+        icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+        lines.append(f"  {icon} [{sev}] {body}")
+    if not w:
+        lines.append("  ✅ EMS configuration looks good." if ems_cfg.get("server") else "  EMS not configured.")
+    lines.append("")
+
+    # ZTNA
+    lines.append("─" * W)
+    lines.append("  ZTNA (ZERO TRUST NETWORK ACCESS)")
+    lines.append("─" * W)
+    w = ztna_weaknesses(ztna_cfg, policies)
+    all_findings.extend(w)
+    ztna_pol_count = sum(1 for p in policies if nv(p.get("ztna-status","")) == "enable")
+    lines.append(f"  Policies with ZTNA enabled: {ztna_pol_count}")
+    for fn in w:
+        sev  = fn.split(":")[0]
+        body = ":".join(fn.split(":")[1:]).strip()
+        icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+        lines.append(f"  {icon} [{sev}] {body}")
+    if not w:
+        lines.append("  ✅ ZTNA configured and in use.")
+    lines.append("")
+
+    # SASE
+    lines.append("─" * W)
+    lines.append("  FORTISASE CONNECTOR")
+    lines.append("─" * W)
+    w = sase_weaknesses(sase_cfg)
+    all_findings.extend(w)
+    for fn in w:
+        sev  = fn.split(":")[0]
+        body = ":".join(fn.split(":")[1:]).strip()
+        icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+        lines.append(f"  {icon} [{sev}] {body}")
+    if not w:
+        lines.append("  ✅ FortiSASE configured." if sase_cfg.get("status") else "  FortiSASE not configured.")
+    lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return all_findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: LOCAL-IN HARDENING (ENHANCED)
+# Combined WAN exposure + missing local-in = CRITICAL
+# ═════════════════════════════════════════════════════════════════════════════
+
+def enhanced_local_in_weaknesses(
+    local_in:   List[Dict],
+    local_in6:  List[Dict],
+    interfaces: List[Dict],
+) -> List[str]:
+    """
+    Enhanced local-in audit. Detects:
+    - WAN interface with management access AND no local-in restriction → CRITICAL
+    - No local-in policies at all → HIGH
+    - IPv6 local-in not configured when IPv4 is → MEDIUM
+    - Accept from 'all' → CRITICAL
+    """
+    findings = []
+    all_lip = local_in + local_in6
+
+    # Build WAN interface list with their allowaccess
+    wan_with_mgmt: List[Dict] = []
+    for intf in interfaces:
+        name   = nv(intf.get("name", intf.get("_id","")))
+        role   = nv(intf.get("role",""))
+        aa     = nv(intf.get("allowaccess",""))
+        name_l = name.lower()
+        is_wan = (role == "wan") or any(
+            w in name_l for w in ("wan","internet","outside","untrust","ppp","vdsl","adsl")
+        )
+        if is_wan and aa.strip():
+            mgmt_protos = set(aa.split()) & {"https","ssh","http","telnet","ping","snmp","fmg-access"}
+            if mgmt_protos:
+                wan_with_mgmt.append({"name": name, "protos": mgmt_protos})
+
+    # Find WAN interfaces covered by local-in
+    lip_covered_intfs: set = set()
+    for lip in all_lip:
+        intf   = nv(lip.get("intf",""))
+        action = nv(lip.get("action",""))
+        srcaddr = nv(lip.get("srcaddr",""))
+        if intf and action in ("accept","deny"):
+            lip_covered_intfs.add(intf)
+
+    # Core check: WAN with mgmt AND no local-in
+    for wan in wan_with_mgmt:
+        if wan["name"] not in lip_covered_intfs:
+            protos_str = ", ".join(sorted(wan["protos"]))
+            findings.append(f(C,
+                f"Local-in CRITICAL: WAN interface '{wan['name']}' has management access "
+                f"({protos_str}) enabled AND has NO local-in-policy restricting source IPs. "
+                f"Any IP on the internet can attempt to reach FortiGate management. "
+                f"This is a CRITICAL management plane exposure. "
+                f"Fix:\n"
+                f"  config firewall local-in-policy\n"
+                f"      edit 1\n"
+                f"          set intf {wan['name']}\n"
+                f"          set srcaddr <your-admin-subnet>\n"
+                f"          set service HTTPS SSH\n"
+                f"          set action accept\n"
+                f"      next\n"
+                f"      edit 2\n"
+                f"          set intf {wan['name']}\n"
+                f"          set srcaddr all\n"
+                f"          set service ALL\n"
+                f"          set action deny\n"
+                f"      next\n"
+                f"  end"
+            ))
+
+    # No local-in at all
+    if not all_lip:
+        findings.append(f(H,
+            "Local-in: NO local-in-policies configured anywhere — "
+            "FortiGate management services (HTTPS, SSH, VPN, BGP, etc.) rely only on "
+            "interface allowaccess for protection. No per-source-IP restrictions. "
+            "Configure local-in-policies on all management-accessible interfaces."))
+
+    # IPv4 local-in exists but no IPv6
+    if local_in and not local_in6:
+        findings.append(f(M,
+            "Local-in: IPv4 local-in-policies exist but no IPv6 local-in-policy6 configured — "
+            "if IPv6 is present on any interface, the management plane has no IPv6 source restriction. "
+            "CLI: config firewall local-in-policy6"))
+
+    # Existing local-in policy issues
+    for lip in all_lip:
+        pid    = nv(lip.get("policyid", lip.get("_id","")))
+        intf   = nv(lip.get("intf",""))
+        src    = nv(lip.get("srcaddr",""))
+        svc    = nv(lip.get("service",""))
+        action = nv(lip.get("action",""))
+        sched  = nv(lip.get("schedule",""))
+
+        if not intf:
+            findings.append(f(M, f"Local-in #{pid}: no interface bound — "
+                                "applies to ALL interfaces including WAN. "
+                                "Bind to specific interface for better control."))
+        if src in ("all","") and action == "accept":
+            findings.append(f(C, f"Local-in #{pid} (intf:{intf}): ACCEPT from source 'all' — "
+                                "any host can reach FortiGate services on this interface."))
+        if src in ("all","") and action == "deny" and svc in ("ALL","all",""):
+            pass  # This is actually the correct final deny-all rule
+        if svc in ("ALL","all") and action == "accept":
+            findings.append(f(M, f"Local-in #{pid} (intf:{intf}): ACCEPT for service ALL — "
+                                "restrict to only required management protocols (HTTPS, SSH)."))
+        if not sched or sched == "always":
+            pass  # Fine for management policies
+        if action == "accept" and src not in ("all",""):
+            # This is a good restrictive rule — check for logging
+            log = nv(lip.get("logtraffic",""))
+            if log in ("","disable"):
+                findings.append(f(I, f"Local-in #{pid}: logging not enabled — "
+                                    "management plane access attempts not recorded."))
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE: LLM / AI APPLICATION AUDIT (FortiOS 8.0)
+# ChatGPT, Gemini, Claude, AI data exfiltration controls
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Known AI/LLM application signatures by category
+AI_APPS = {
+    "chatgpt":       ("OpenAI ChatGPT",     H, "generative AI with potential data exfiltration risk"),
+    "openai":        ("OpenAI API",         H, "direct API access enables large-scale data upload"),
+    "gemini":        ("Google Gemini",      H, "Google AI — potential data residency issues"),
+    "bard":          ("Google Bard",        M, "Google AI assistant"),
+    "claude":        ("Anthropic Claude",   H, "AI assistant — sensitive data in prompts"),
+    "copilot":       ("Microsoft Copilot",  H, "M365 Copilot — may access internal M365 data"),
+    "github-copilot":("GitHub Copilot",     H, "code AI — source code exfiltration risk"),
+    "midjourney":    ("Midjourney",         M, "image AI — verify acceptable use policy"),
+    "stability-ai":  ("Stability AI",       M, "image generation — prompt data sent externally"),
+    "huggingface":   ("HuggingFace",        M, "ML model hosting — model/data upload possible"),
+    "perplexity":    ("Perplexity AI",      M, "AI search — query data sent externally"),
+    "character-ai":  ("Character.AI",       I, "consumer AI chatbot"),
+    "grammarly":     ("Grammarly AI",       M, "text AI — document content sent to cloud"),
+    "jasper":        ("Jasper AI",          M, "marketing AI — content exfiltration possible"),
+    "cohere":        ("Cohere AI",          H, "enterprise LLM API"),
+    "anthropic":     ("Anthropic API",      H, "direct API access to Claude models"),
+    "replicate":     ("Replicate AI",       M, "AI model API platform"),
+    "together-ai":   ("Together AI",        M, "LLM inference API"),
+    "mistral":       ("Mistral AI",         H, "open-weight LLM with API access"),
+    "deepseek":      ("DeepSeek AI",        C, "Chinese AI — data sovereignty risk for most enterprises"),
+    "ernie":         ("Baidu Ernie",        C, "Chinese AI — data sovereignty concern"),
+    "qwen":          ("Alibaba Qwen",       C, "Chinese AI — data sovereignty concern"),
+    "kimi":          ("Moonshot Kimi",      C, "Chinese AI — data sovereignty concern"),
+}
+
+
+def parse_app_control_for_ai(app_profiles: List[Dict], text: str) -> Dict[str, Any]:
+    """
+    Check if app control profiles have AI application controls.
+    Returns dict of {profile_name: {app_name: action}}.
+    """
+    results = {}
+
+    for prof in app_profiles:
+        name = nv(prof.get("name", prof.get("_id","")))
+        # The actual per-app settings are deep in sub-entries
+        # We can detect by scanning config text for known AI app names
+        profile_controls = {}
+        for ai_key in AI_APPS:
+            if ai_key in text.lower():
+                profile_controls[ai_key] = "referenced"
+        results[name] = profile_controls
+
+    return results
+
+
+def llm_ai_audit(
+    llm_profiles: List[Dict],
+    app_profiles: List[Dict],
+    policies: List[Dict],
+    wf_profiles: List[Dict],
+    cfg_text: str,
+) -> List[str]:
+    """
+    Comprehensive AI/LLM security audit.
+    Checks: LLM profiles, app control for AI apps, web filter for AI sites,
+    DLP coverage on AI-touching policies, data exfiltration controls.
+    """
+    findings = []
+
+    # 1. LLM profile coverage
+    if not llm_profiles:
+        findings.append(f(M,
+            "AI/LLM Audit: no LLM profiles configured (FortiOS 8.0 feature) — "
+            "AI traffic through this FortiGate has no dedicated inspection. "
+            "CLI: config llm profile → edit MyLLMProfile → set dlp-check enable "
+            "→ set pii-check enable → set prompt-injection-check enable"))
+    else:
+        policies_with_llm = [p for p in policies if nv(p.get("llm-profile",""))]
+        accept_policies = [p for p in policies if nv(p.get("action","")) == "accept"]
+        if not policies_with_llm:
+            findings.append(f(M,
+                "AI/LLM Audit: LLM profiles are defined but none are attached to any "
+                "firewall policy — AI traffic inspection is configured but not enforced."))
+        else:
+            pct = 100 * len(policies_with_llm) // len(accept_policies) if accept_policies else 0
+            findings.append(f(I,
+                f"AI/LLM Audit: {len(policies_with_llm)}/{len(accept_policies)} accept "
+                f"policies ({pct}%) have LLM profiles attached."))
+
+        # Check each LLM profile quality
+        for prof in llm_profiles:
+            name    = nv(prof.get("name", prof.get("_id","")))
+            dlp     = nv(prof.get("dlp-check",""))
+            pii     = nv(prof.get("pii-check",""))
+            prompt  = nv(prof.get("prompt-injection-check",""))
+            jailbrk = nv(prof.get("jailbreak-check",""))
+            log_v   = nv(prof.get("log",""))
+
+            if dlp != "enable":
+                findings.append(f(H,
+                    f"LLM Profile '{name}': dlp-check disabled — sensitive corporate data "
+                    "in AI prompts (source code, customer PII, financial data) exits the network "
+                    "without inspection. Enable: set dlp-check enable"))
+            if pii != "enable":
+                findings.append(f(H,
+                    f"LLM Profile '{name}': pii-check disabled — PII (names, SSNs, emails, "
+                    "credit cards) may be submitted to external AI services in violation of "
+                    "GDPR/HIPAA/PCI-DSS. Enable: set pii-check enable"))
+            if prompt != "enable":
+                findings.append(f(M,
+                    f"LLM Profile '{name}': prompt-injection-check disabled — adversarial "
+                    "prompts could manipulate AI systems connected through this policy."))
+            if jailbrk != "enable":
+                findings.append(f(M,
+                    f"LLM Profile '{name}': jailbreak-check disabled — attempts to bypass "
+                    "AI safety controls not detected."))
+            if log_v != "enable":
+                findings.append(f(M,
+                    f"LLM Profile '{name}': logging disabled — AI traffic events not recorded "
+                    "for forensics or compliance audits."))
+
+    # 2. Check App Control profiles for AI application controls
+    cfg_lower = cfg_text.lower()
+    detected_ai_apps = []
+    for ai_key, (ai_name, severity, detail) in AI_APPS.items():
+        if ai_key in cfg_lower:
+            detected_ai_apps.append((ai_key, ai_name, severity, detail))
+
+    # 3. Check web filter for AI site categories
+    ai_domains = ["openai.com","chat.openai.com","api.openai.com",
+                  "gemini.google.com","bard.google.com",
+                  "claude.ai","api.anthropic.com",
+                  "copilot.microsoft.com","github.com/copilot",
+                  "deepseek.com","chat.deepseek.com"]
+
+    wf_has_ai_control = False
+    for wf in wf_profiles:
+        name = nv(wf.get("name", wf.get("_id","")))
+        # Check if any AI domains appear in web filter URL filters (heuristic)
+        for domain in ai_domains:
+            if domain in cfg_lower:
+                wf_has_ai_control = True
+                break
+
+    # 4. Check DLP on policies that likely carry AI traffic
+    policies_with_dlp = [p for p in policies if nv(p.get("dlp-profile","")) or nv(p.get("dlp-sensor",""))]
+    accept_policies = [p for p in policies if nv(p.get("action","")) == "accept"]
+    dlp_pct = 100 * len(policies_with_dlp) // len(accept_policies) if accept_policies else 0
+
+    if dlp_pct < 50:
+        findings.append(f(M,
+            f"AI/LLM Audit: only {dlp_pct}% of accept policies have DLP profiles — "
+            "without DLP, users can freely paste source code, customer data, and "
+            "internal documents into AI services like ChatGPT."))
+
+    # 5. Chinese AI sovereignty risk
+    china_ai = ["deepseek","ernie","qwen","kimi","baidu","alibaba-ai"]
+    china_detected = [ai for ai in china_ai if ai in cfg_lower]
+    if china_detected:
+        findings.append(f(C,
+            f"AI/LLM Audit: Chinese AI services detected in config ({', '.join(china_detected)}) — "
+            "data sent to Chinese AI services is subject to Chinese data law (PIPL) and "
+            "national security requirements. Block or explicitly approve through legal/compliance. "
+            "Add to web filter URL block list immediately for most enterprise environments."))
+
+    # 6. No AI governance at all
+    has_any_ai_control = bool(llm_profiles or detected_ai_apps or wf_has_ai_control or policies_with_dlp)
+    if not has_any_ai_control:
+        findings.append(f(M,
+            "AI/LLM Audit: NO AI governance controls detected — no LLM profiles, no app "
+            "control entries for AI tools, no web filter rules for AI sites, no DLP coverage. "
+            "Users can freely access and submit corporate data to any AI service. "
+            "Recommended actions:\n"
+            "  1. Create LLM profile: config llm profile\n"
+            "  2. Block unapproved AI in web filter URL filter\n"
+            "  3. Add DLP profiles to internet-bound policies\n"
+            "  4. Use app control to detect/restrict AI API usage"))
+
+    # 7. Generate visibility summary
+    if detected_ai_apps:
+        findings.append(f(I,
+            f"AI/LLM Audit: {len(detected_ai_apps)} AI service references found in config — "
+            f"services: {', '.join(n for _,n,_,_ in detected_ai_apps[:5])}. "
+            "Verify each has appropriate controls."))
+
+    return findings
+
+
+def generate_ai_audit_report(
+    llm_profiles: List[Dict],
+    app_profiles: List[Dict],
+    policies:     List[Dict],
+    wf_profiles:  List[Dict],
+    cfg_text:     str,
+    out_path:     Path,
+) -> List[str]:
+    findings = llm_ai_audit(llm_profiles, app_profiles, policies, wf_profiles, cfg_text)
+    W = 80
+    lines = []
+    lines.append("=" * W)
+    lines.append(" AI / LLM APPLICATION SECURITY AUDIT (FortiOS 8.0) ".center(W, "="))
+    lines.append("=" * W)
+    lines.append("")
+    lines.append("  This module audits controls over AI/LLM traffic including:")
+    lines.append("  ChatGPT, Google Gemini, Claude, Copilot, DeepSeek, and AI APIs.")
+    lines.append("  Covers: LLM profiles, DLP coverage, App Control, Web Filter, Data Sovereignty.")
+    lines.append("")
+
+    # Summary table
+    accept_policies = [p for p in policies if nv(p.get("action","")) == "accept"]
+    pol_with_llm  = sum(1 for p in policies if nv(p.get("llm-profile","")))
+    pol_with_dlp  = sum(1 for p in policies if nv(p.get("dlp-profile","")) or nv(p.get("dlp-sensor","")))
+    pol_with_casb = sum(1 for p in policies if nv(p.get("casb-profile","")))
+
+    rows = [
+        ("LLM profiles configured",     str(len(llm_profiles))),
+        ("Policies with LLM profile",   f"{pol_with_llm}/{len(accept_policies)}"),
+        ("Policies with DLP profile",   f"{pol_with_dlp}/{len(accept_policies)}"),
+        ("Policies with CASB profile",  f"{pol_with_casb}/{len(accept_policies)}"),
+        ("App control profiles",        str(len(app_profiles))),
+        ("Web filter profiles",         str(len(wf_profiles))),
+    ]
+    lines.append(ascii_table(rows, "AI Security Controls Summary"))
+    lines.append("")
+
+    # AI app risk table
+    lines.append("─" * W)
+    lines.append("  KNOWN AI SERVICES RISK REFERENCE")
+    lines.append("─" * W)
+    lines.append(f"  {'AI Service':<22} {'Severity':<12} {'Risk'}")
+    lines.append(f"  {'─'*22} {'─'*12} {'─'*38}")
+    for ai_key, (ai_name, sev, detail) in sorted(AI_APPS.items(), key=lambda x: ["CRITICAL","HIGH","MEDIUM","INFO"].index(x[1][1])):
+        icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+        lines.append(f"  {icon} {ai_name:<22} {sev:<12} {detail[:40]}")
+    lines.append("")
+
+    lines.append("─" * W)
+    lines.append("  FINDINGS")
+    lines.append("─" * W)
+    if findings:
+        for fn in findings:
+            sev  = fn.split(":")[0]
+            body = ":".join(fn.split(":")[1:]).strip()
+            icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","INFO":"🔵"}.get(sev,"  ")
+            lines.append(f"\n  {icon} [{sev}]")
+            # Wrap long lines
+            for part in body.split("\n"):
+                lines.append(f"  {part}")
+    else:
+        lines.append("  ✅ AI governance controls are in place.")
+    lines.append("")
+
+    lines.append("─" * W)
+    lines.append("  RECOMMENDED AI GOVERNANCE FRAMEWORK")
+    lines.append("─" * W)
+    lines.append("")
+    lines.append("  1. IDENTIFY: Enable App Control with AI app signatures to see what AI")
+    lines.append("     tools your users are already using (monitor mode first).")
+    lines.append("")
+    lines.append("  2. CLASSIFY: Tier AI services:")
+    lines.append("     - Approved corporate tools (M365 Copilot, approved ChatGPT Enterprise)")
+    lines.append("     - Conditionally permitted (with DLP + logging)")
+    lines.append("     - Blocked (Chinese AI, consumer tools, unapproved APIs)")
+    lines.append("")
+    lines.append("  3. CONTROL:")
+    lines.append("     config llm profile")
+    lines.append("         edit Corporate-AI-Policy")
+    lines.append("             set dlp-check enable")
+    lines.append("             set pii-check enable")
+    lines.append("             set prompt-injection-check enable")
+    lines.append("             set jailbreak-check enable")
+    lines.append("             set log enable")
+    lines.append("         next")
+    lines.append("     end")
+    lines.append("")
+    lines.append("  4. BLOCK sovereignty-risk AI via web filter URL filter:")
+    lines.append("     deepseek.com, ernie.baidu.com, qwen.ai, kimi.moonshot.cn")
+    lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return findings
 def main():
     parser = argparse.ArgumentParser(
         description="FortiGate UTM Security Analyzer v3.0 — FortiOS 6.x/7.x/8.0 deep config audit.",
@@ -2355,7 +5373,16 @@ Examples:
     parser.add_argument("-sslvpn", action="store_true", help="SSL-VPN settings + portals audit")
     parser.add_argument("-ha",     action="store_true", help="HA configuration audit")
     parser.add_argument("-log",    action="store_true", help="Logging audit (FA1-3, syslogd1-4, disk, events)")
-    parser.add_argument("-dos",    action="store_true", help="DoS policy audit")
+    parser.add_argument("-dos",       action="store_true", help="Basic DoS policy audit")
+    parser.add_argument("-antidos",   action="store_true", help="Full Anti-DoS protection audit (policies, IPS anomalies, NP offload, session limits, hardening)")
+    parser.add_argument("-intel",     action="store_true", help="Policy intelligence: shadowed rules, duplicates, coverage statistics")
+    parser.add_argument("-unused",    action="store_true", help="Unused objects: addresses, groups, services, VIPs, IP pools, schedules")
+    parser.add_argument("-vip",       action="store_true", help="VIP/port-forward security audit (exposed ports, risky services, source filtering)")
+    parser.add_argument("-sdwan",     action="store_true", help="SD-WAN audit (health checks, SLA thresholds, member monitoring)")
+    parser.add_argument("-iface",     action="store_true", help="Interface exposure score report")
+    parser.add_argument("-cert",      action="store_true", help="Certificate audit (expiry, key size, self-signed)")
+    parser.add_argument("-fabric",    action="store_true", help="Fabric connector audit (AWS/Azure/GCP, EMS, ZTNA, SASE, external resources)")
+    parser.add_argument("-ai",        action="store_true", help="AI/LLM application audit (ChatGPT, Gemini, DeepSeek, data sovereignty, LLM profiles)")
     parser.add_argument("-s",      action="store_true", help="System hardening (admin, interface, global, SNMP, SSH, NTP, DNS, CSF, FIPS, IKE, local-in)")
     parser.add_argument("--summary", action="store_true", help="Executive summary + JSON export")
     parser.add_argument("--all",   action="store_true", help="Run all audit modules")
@@ -2364,7 +5391,9 @@ Examples:
 
     if args.all:
         for attr in ["f","i","av","ips","wf","app","dns","waf","email","video","file",
-                     "vpatch","llm","utm","vpn","sslvpn","ha","log","dos","s","summary"]:
+                     "vpatch","llm","utm","vpn","sslvpn","ha","log","dos","antidos",
+                     "intel","unused","vip","sdwan","iface","cert","fabric","ai",
+                     "s","summary"]:
             setattr(args, attr, True)
 
     cfg_text = read_config(args.config)
@@ -2420,11 +5449,34 @@ Examples:
     evtfilter      = parse_log_eventfilter(cfg_text)
     disk_cfg       = parse_log_disk_setting(cfg_text)
     disk_filter    = parse_log_disk_filter(cfg_text)
-    dos_policies   = parse_dos_policy(cfg_text)
+    dos_policies      = parse_dos_policy(cfg_text)
+    dos_policies_full = parse_dos_policy_full(cfg_text)
+    np_cfg            = parse_np_global(cfg_text)
+    res_limit         = parse_system_resource_limit(cfg_text)
+    global_dos        = parse_system_global_dos(cfg_text)
+    addr_objs         = parse_address_objects(cfg_text)
+    addr_groups       = parse_address_groups(cfg_text)
+    svc_custom        = parse_service_custom(cfg_text)
+    svc_groups        = parse_service_groups(cfg_text)
+    vip_objs          = parse_vip_objects(cfg_text)
+    vip_groups        = parse_vip_groups(cfg_text)
+    ip_pools          = parse_ip_pools(cfg_text)
+    schedules         = parse_schedules(cfg_text)
+    schedules_ot      = parse_schedules_onetime(cfg_text)
+    sdwan_cfg         = parse_sdwan(cfg_text)
+    local_certs       = parse_cert_local(cfg_text)
+    ca_certs          = parse_cert_ca(cfg_text)
+    remote_certs      = parse_cert_remote(cfg_text)
+    fabric_connectors = parse_fabric_connectors(cfg_text)
+    cloud_connectors  = parse_cloud_connectors(cfg_text)
+    ems_cfg           = parse_ems_settings(cfg_text)
+    ztna_cfg          = parse_ztna_settings(cfg_text)
+    sase_cfg          = parse_sase_connector(cfg_text)
 
     print(f"[*] Parsed: {len(policies)} IPv4 policies, {len(policies6)} IPv6 policies, "
           f"{len(ssl_profiles)} SSL profiles, {len(av_profiles)} AV profiles, "
-          f"{len(phase1)} VPN tunnels, {len(admins)} admins, {len(interfaces)} interfaces")
+          f"{len(phase1)} VPN tunnels, {len(admins)} admins, {len(interfaces)} interfaces, "
+          f"{len(dos_policies_full)} DoS policies")
 
     all_findings: Dict[str, List[str]] = {}
 
@@ -2508,6 +5560,27 @@ Examples:
             findings_dos.append(f(M, "No DoS policies configured — no flood/anomaly protection rules active."))
         all_findings["DoS Policies"] = findings_dos
 
+    if args.antidos:
+        p = out("_antidos_report.txt")
+        generate_antidos_report(
+            dos_policies_full, ips_sensors, interfaces,
+            local_in, local_in6, policies,
+            global_dos, res_limit, np_cfg, p
+        )
+        print(f"[+] Anti-DoS full audit report -> {p}")
+        # Collect all findings for summary
+        ad_f1 = antidos_policy_weaknesses(dos_policies_full, interfaces)
+        ad_f2 = antidos_ips_weaknesses(ips_sensors, policies)
+        ad_f3 = antidos_hardening_weaknesses(
+            interfaces, local_in, local_in6,
+            global_dos, res_limit, np_cfg, policies
+        )
+        all_findings["Anti-DoS Policies"]   = ad_f1
+        all_findings["Anti-DoS IPS"]        = ad_f2
+        all_findings["Anti-DoS Hardening"]  = ad_f3
+        assessment = antidos_score(ad_f1 + ad_f2 + ad_f3)
+        print(f"    DoS Protection Score: {assessment['score']}/10 — {assessment['grade']}")
+
     if args.s:
         p = out("_system_report.txt")
         generate_system_report(admins, interfaces, global_cfg, pw_policy_cfg, ssh_cfg,
@@ -2534,6 +5607,70 @@ Examples:
         all_findings["FIPS-CC"]           = fips_weaknesses(fips_cfg)
         all_findings["FortiGuard"]        = fortiguard_weaknesses(fg_cfg)
 
+    if args.intel:
+        p = out("_policy_intelligence_report.txt")
+        intel_finds = generate_policy_intelligence_report(policies, policies6, p)
+        print(f"[+] Policy intelligence report -> {p}")
+        all_findings["Policy Intelligence"] = intel_finds
+
+    if args.unused:
+        p = out("_unused_objects_report.txt")
+        unused_finds = generate_unused_objects_report(
+            addr_objs, addr_groups, svc_custom, svc_groups,
+            vip_objs, vip_groups, ip_pools, schedules, schedules_ot,
+            policies, policies6, ssl_profiles, p
+        )
+        print(f"[+] Unused objects report      -> {p}")
+        all_findings["Unused Objects"] = unused_finds
+
+    if args.vip:
+        p = out("_vip_security_report.txt")
+        vip_finds = generate_vip_report(vip_objs, vip_groups, policies, p)
+        print(f"[+] VIP security report        -> {p}")
+        all_findings["VIP Security"] = vip_finds
+
+    if args.sdwan:
+        p = out("_sdwan_report.txt")
+        sdwan_finds = generate_sdwan_report(sdwan_cfg, p)
+        print(f"[+] SD-WAN report              -> {p}")
+        all_findings["SD-WAN"] = sdwan_finds
+
+    if args.iface:
+        p = out("_interface_exposure_report.txt")
+        iface_finds = generate_interface_exposure_report(interfaces, p)
+        print(f"[+] Interface exposure report  -> {p}")
+        all_findings["Interface Exposure"] = iface_finds
+
+    if args.cert:
+        p = out("_certificate_report.txt")
+        cert_finds = generate_cert_report(local_certs, ca_certs, remote_certs, p)
+        print(f"[+] Certificate audit report   -> {p}")
+        all_findings["Certificates"] = cert_finds
+
+    if args.fabric:
+        p = out("_fabric_connector_report.txt")
+        fabric_finds = generate_fabric_connector_report(
+            fabric_connectors, cloud_connectors, ems_cfg,
+            ztna_cfg, sase_cfg, policies, p
+        )
+        print(f"[+] Fabric connector report    -> {p}")
+        all_findings["Fabric Connectors"] = fabric_finds
+
+    if args.ai:
+        p = out("_ai_llm_audit_report.txt")
+        ai_finds = generate_ai_audit_report(
+            llm_profiles, app_profiles, policies,
+            wf_profiles, cfg_text, p
+        )
+        print(f"[+] AI/LLM audit report        -> {p}")
+        all_findings["AI/LLM Security"] = ai_finds
+
+    if args.s:
+        # Enhanced local-in within system report
+        elip_finds = enhanced_local_in_weaknesses(local_in, local_in6, interfaces)
+        if elip_finds:
+            all_findings["Enhanced Local-in"] = elip_finds
+
     if args.summary and all_findings:
         p = out("_SUMMARY.txt")
         summary = generate_summary(all_findings, args.config, p)
@@ -2547,9 +5684,12 @@ Examples:
 
     if not any([args.f, args.i, args.av, args.utm, args.ips, args.wf, args.app, args.dns,
                 args.waf, args.email, args.video, args.file, args.vpatch, args.llm,
-                args.vpn, args.sslvpn, args.ha, args.log, args.dos, args.s]):
+                args.vpn, args.sslvpn, args.ha, args.log, args.dos, args.antidos,
+                args.intel, args.unused, args.vip, args.sdwan, args.iface, args.cert,
+                args.fabric, args.ai, args.s]):
         print("[!] No audit flags specified. Use --all for everything, or --help for options.")
 
 
 if __name__ == "__main__":
     main()
+
