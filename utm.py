@@ -6410,6 +6410,8 @@ Examples:
     parser.add_argument('--saml', action='store_true', help='SAML hardening audit')
     parser.add_argument('--mfa', action='store_true', help='Administrator MFA audit (included in -s)')
     parser.add_argument("--html", action="store_true", help="Additional self-contained offline HTML report (explicit opt-in)")
+    parser.add_argument("--out-dir", "--output-dir", default=".", metavar="DIRECTORY",
+                        help="Write all reports to DIRECTORY (default: current directory)")
     parser.add_argument("--all",   action="store_true", help="Run all audit modules")
 
     args = parser.parse_args()
@@ -6423,9 +6425,18 @@ Examples:
 
     cfg_text = read_config(args.config)
     base = Path(args.config).name
+
+    out_dir = Path(args.out_dir).expanduser()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        parser.error(f"Cannot create output directory '{out_dir}': {exc}")
+
     references = {} if args.html else None
-    out = lambda suffix: (Path(f"{base}{suffix}") if suffix == "_SUMMARY.txt"
-                          else ReportOutput(f"{base}{suffix}", references))
+
+    def out(suffix):
+        path = out_dir / f"{base}{suffix}"
+        return path if suffix == "_SUMMARY.txt" else ReportOutput(path, references)
 
     print(f"[*] Parsing config: {args.config}")
 
@@ -6726,7 +6737,7 @@ Examples:
         coverage_notes.append('Legacy audit domains use the first matching block. Complete multi-VDOM coverage is unavailable; new BGP/authentication checks support explicit VDOM scopes.')
 
     if args.html:
-        p = Path(f"{base}_REPORT.html")
+        p = out_dir / f"{base}_REPORT.html"
         generate_html_report(all_findings, cfg_text, args.config, p, references, coverage_notes, statuses)
         print(f"[+] Offline HTML dashboard     -> {p}")
 
