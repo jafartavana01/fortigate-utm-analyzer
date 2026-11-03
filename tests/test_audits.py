@@ -196,10 +196,10 @@ class ExtraSecurityTests(unittest.TestCase):
             cfg=Path(tmp)/'fw.conf';cfg.write_text(bgp()+'\n'+entry('user ldap','corp','set secure disable'))
             r=subprocess.run([sys.executable,str(ROOT/'utm.py'),'-c',str(cfg),'-bgp','-auth','--summary','--html'],cwd=tmp,capture_output=True,text=True)
             self.assertEqual(r.returncode,0,r.stderr)
-            data=json.loads((Path(tmp)/'fw.conf_SUMMARY.json').read_text())
+            data=json.loads((Path(tmp)/'fw'/'fw.conf_SUMMARY.json').read_text())
             self.assertEqual(data['summary']['total'],5)
             self.assertEqual(set(data),{'summary','findings'})
-            self.assertTrue((Path(tmp)/'fw.conf_REPORT.html').exists())
+            self.assertTrue((Path(tmp)/'fw'/'fw.conf_REPORT.html').exists())
     def test_all_legacy_flags_parse(self):
         flags=['-f','-i','-av','-ips','-wf','-app','-dns','-waf','-email','-video','-file','-vpatch','-llm','-utm','-vpn','-sslvpn','-ha','-log','-dos','-antidos','-intel','-unused','-vip','-sdwan','-iface','-cert','-fabric','-ai','-s']
         with tempfile.TemporaryDirectory() as tmp:

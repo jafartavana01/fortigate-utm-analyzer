@@ -14,9 +14,9 @@ BASE = SAMPLE.name
 
 
 class OutputDirectoryTests(unittest.TestCase):
-    def run_analyzer(self, cwd, *args):
+    def run_analyzer(self, cwd, *args, config=None):
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "-c", str(SAMPLE), *args],
+            [sys.executable, str(SCRIPT), "-c", str(config or SAMPLE), *args],
             cwd=cwd, capture_output=True, text=True,
         )
 
@@ -28,6 +28,7 @@ class OutputDirectoryTests(unittest.TestCase):
                                        "--out-dir", str(destination))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(destination.is_dir())
+            self.assertFalse((root / SAMPLE.stem).exists())
             produced = {p.name for p in destination.iterdir()}
             self.assertIn(BASE + "_SUMMARY.txt", produced)
             self.assertIn(BASE + "_SUMMARY.json", produced)
@@ -59,13 +60,40 @@ class OutputDirectoryTests(unittest.TestCase):
             self.assertEqual(non_directory.read_text(encoding="utf-8"), "not a directory")
             self.assertFalse(list(root.glob(BASE + "*")))
 
-    def test_default_still_writes_in_working_directory(self):
+    def test_default_creates_input_stem_directory(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             result = self.run_analyzer(root, "-f", "--summary")
             self.assertEqual(result.returncode, 0, result.stderr)
+            destination = root / SAMPLE.stem
+            self.assertTrue(destination.is_dir())
+            self.assertTrue((destination / (BASE + "_firewall_policy_report.txt")).is_file())
+            self.assertTrue((destination / (BASE + "_SUMMARY.json")).is_file())
+            self.assertFalse((root / (BASE + "_SUMMARY.json")).exists())
+
+    def test_default_for_cfg_filename_includes_html(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / "firewal_001.cfg"
+            config.write_bytes(SAMPLE.read_bytes())
+            result = self.run_analyzer(root, "-f", "--summary", "--html", config=config)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            destination = root / "firewal_001"
+            self.assertTrue(destination.is_dir())
+            self.assertTrue((destination / "firewal_001.cfg_firewall_policy_report.txt").is_file())
+            self.assertTrue((destination / "firewal_001.cfg_SUMMARY.txt").is_file())
+            self.assertTrue((destination / "firewal_001.cfg_SUMMARY.json").is_file())
+            self.assertTrue((destination / "firewal_001.cfg_REPORT.html").is_file())
+            self.assertFalse((root / "firewal_001.cfg_REPORT.html").exists())
+
+    def test_explicit_dot_keeps_output_in_working_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = self.run_analyzer(root, "-f", "--summary", "--out-dir", ".")
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((root / (BASE + "_firewall_policy_report.txt")).is_file())
             self.assertTrue((root / (BASE + "_SUMMARY.json")).is_file())
+            self.assertFalse((root / SAMPLE.stem).exists())
 
 
 if __name__ == "__main__":

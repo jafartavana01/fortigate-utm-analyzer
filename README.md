@@ -432,7 +432,7 @@ python3 utm.py -c <config_file> [flags]
 | `-ai` | AI/LLM application security | `_ai_llm_audit_report.txt` |
 | **Reporting** | | |
 | `--summary` | Executive summary + JSON export | `_SUMMARY.txt` + `_SUMMARY.json` |
-| `--out-dir DIRECTORY` (`--output-dir`) | Save all reports in DIRECTORY, creating it if needed (default: current directory) | All generated reports |
+| `--out-dir DIRECTORY` (`--output-dir`) | Override the default output folder (input filename without extension); creates directories as needed | All generated reports |
 | `--all` | Everything above in one run | all of the above |
 
 ### Common Workflows
@@ -467,7 +467,7 @@ python3 utm.py -c sample_config.conf --all
 
 ## 📁 Output Files
 
-All outputs are named from the config file and written to the current working directory by default. Use `--out-dir` (or `--output-dir`) to direct **all TXT, JSON, and HTML reports** to another directory; missing parent directories are created automatically. For example:
+All outputs keep their input-derived filenames. By default, the analyzer creates a subdirectory of the current working directory named after the **configuration filename without its final extension** (not the hostname inside the FortiGate configuration). For example, `-c firewal_001.cfg` writes to `./firewal_001/`. Use `--out-dir` (or `--output-dir`) to override this directory for **all TXT, JSON, and HTML reports**; missing parent directories are created automatically. Pass `--out-dir .` to write directly to the current working directory as in older releases. For example:
 
 ```bash
 python3 utm.py -c /backups/fw-prod.conf --all --html --out-dir /reports/fw-prod
