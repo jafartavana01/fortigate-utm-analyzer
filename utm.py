@@ -6410,8 +6410,8 @@ Examples:
     parser.add_argument('--saml', action='store_true', help='SAML hardening audit')
     parser.add_argument('--mfa', action='store_true', help='Administrator MFA audit (included in -s)')
     parser.add_argument("--html", action="store_true", help="Additional self-contained offline HTML report (explicit opt-in)")
-    parser.add_argument("--out-dir", "--output-dir", default=".", metavar="DIRECTORY",
-                        help="Write all reports to DIRECTORY (default: current directory)")
+    parser.add_argument("--out-dir", "--output-dir", default=None, metavar="DIRECTORY",
+                        help="Write reports to DIRECTORY (default: input filename without extension)")
     parser.add_argument("--all",   action="store_true", help="Run all audit modules")
 
     args = parser.parse_args()
@@ -6426,7 +6426,8 @@ Examples:
     cfg_text = read_config(args.config)
     base = Path(args.config).name
 
-    out_dir = Path(args.out_dir).expanduser()
+    out_dir = (Path(args.out_dir).expanduser() if args.out_dir is not None
+               else Path(base).with_suffix(""))
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
