@@ -432,6 +432,7 @@ python3 utm.py -c <config_file> [flags]
 | `-ai` | AI/LLM application security | `_ai_llm_audit_report.txt` |
 | **Reporting** | | |
 | `--summary` | Executive summary + JSON export | `_SUMMARY.txt` + `_SUMMARY.json` |
+| `--out-dir DIRECTORY` (`--output-dir`) | Save all reports in DIRECTORY, creating it if needed (default: current directory) | All generated reports |
 | `--all` | Everything above in one run | all of the above |
 
 ### Common Workflows
@@ -466,7 +467,13 @@ python3 utm.py -c sample_config.conf --all
 
 ## 📁 Output Files
 
-All outputs written to current directory, named from the config file. Running `--all` against `fw-prod.conf` produces:
+All outputs are named from the config file and written to the current working directory by default. Use `--out-dir` (or `--output-dir`) to direct **all TXT, JSON, and HTML reports** to another directory; missing parent directories are created automatically. For example:
+
+```bash
+python3 utm.py -c /backups/fw-prod.conf --all --html --out-dir /reports/fw-prod
+```
+
+Repeated runs with the same input basename in the same output directory overwrite existing reports. Running `--all` against `fw-prod.conf` produces:
 
 ```
 fw-prod.conf_firewall_policy_report.txt
