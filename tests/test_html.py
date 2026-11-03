@@ -123,7 +123,7 @@ class CLITests(unittest.TestCase):
     def run_cli(self,*flags):
         with tempfile.TemporaryDirectory() as tmp:
             r=subprocess.run([sys.executable,str(ROOT/'utm.py'),'-c',str(ROOT/'sample_config.conf'),*flags],cwd=tmp,capture_output=True,text=True)
-            files={p.name:p.read_bytes() for p in Path(tmp).iterdir()}
+            files={p.name:p.read_bytes() for p in (Path(tmp)/'sample_config').iterdir()}
         self.assertEqual(r.returncode,0,r.stderr);return r,files
     def test_html_adds_only_html(self):
         _,old=self.run_cli('-f','--summary');_,new=self.run_cli('-f','--summary','--html')
