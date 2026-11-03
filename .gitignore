@@ -37,3 +37,9 @@ ENV/
 
 # Logs
 *.log
+
+# All audit outputs (including confidential assessment artifacts)
+*_report.txt
+*_SUMMARY.txt
+*_SUMMARY.json
+*_REPORT.html
