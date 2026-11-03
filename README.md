@@ -203,7 +203,7 @@ New combined check that's much more impactful than the previous per-policy check
 | Policy intelligence (shadowed/duplicate/stats) | derived from `firewall policy` |
 | Unused objects (7 object types) | `firewall address/addrgrp/service/vip/ippool/schedule` |
 | VIP / port-forward security | `config firewall vip` |
-| SSL/SSH inspection (v6 flat + v7/8 per-proto) | `config firewall ssl-ssh-profile` |
+| SSL/SSH inspection (v6 flat + v7/8 per-proto; repeated blocks and nested exemptions) | `config firewall ssl-ssh-profile` |
 | Antivirus (v8.0 sub-block aware) | `config antivirus profile` |
 | IPS sensors | `config ips sensor` |
 | Web filter | `config webfilter profile` |
