@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FortiGate UTM Security Analyzer v3.0
+FortiGate UTM Security Analyzer v4.1.0
 Author  : Jafar Tavana  (@jafartavana01)
 License : MIT
 
@@ -29,8 +29,13 @@ All findings tagged CRITICAL / HIGH / MEDIUM / INFO.
 import argparse
 import json
 import re
+import hashlib
+import html
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+__version__ = "4.1.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Generic Helpers
@@ -1020,8 +1025,7 @@ def admin_weaknesses(a: Dict) -> List[str]:
     elif not accprofile:
         findings.append(f(M, f"Admin '{name}': no access profile assigned."))
 
-    if not two_factor or two_factor in ("disable", "none"):
-        findings.append(f(H, f"Admin '{name}': two-factor authentication not enabled."))
+    findings.extend(admin_mfa_findings(a))
 
     try:
         t = int(timeout)
@@ -1170,6 +1174,7 @@ def global_hardening_weaknesses(cfg: Dict) -> List[str]:
     if rest_api == "enable":
         findings.append(f(I, "Global: REST API admin enabled — ensure API keys are rotated and scoped appropriately."))
 
+    findings.extend(crypto_transport_weaknesses(cfg))
     return findings
 
 
@@ -1222,7 +1227,7 @@ def ssh_config_weaknesses(cfg: Dict) -> List[str]:
     kex        = nv(cfg.get("kex", ""))
     weak_enc   = ("arcfour", "3des", "blowfish", "cast128", "des")
     weak_mac   = ("md5", "sha1", "ripemd")
-    weak_kex   = ("diffie-hellman-group1", "diffie-hellman-group14")
+    weak_kex   = ("diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1", "diffie-hellman-group-exchange-sha1")
 
     if enc_algos:
         for w in weak_enc:
@@ -1234,11 +1239,12 @@ def ssh_config_weaknesses(cfg: Dict) -> List[str]:
                 findings.append(f(M, f"SSH: weak MAC '{w}' in integrity algorithms."))
     if kex:
         for w in weak_kex:
-            if w in kex.lower():
+            if w in kex.lower().split():
                 findings.append(f(H, f"SSH: weak key-exchange '{w}' — insecure DH group."))
     if not enc_algos and not mac_algos:
         findings.append(f(I, "SSH: cipher/MAC restrictions not configured — system defaults may include weak algorithms."))
 
+    findings.extend(crypto_transport_weaknesses(cfg))
     return findings
 
 
@@ -5342,9 +5348,1021 @@ def generate_ai_audit_report(
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return findings
+# ─────────────────────────────────────────────────────────────────────────────
+# Offline HTML reporting. Legacy strings remain the summary's source of truth.
+# ─────────────────────────────────────────────────────────────────────────────
+
+AUDIT_DOMAINS = (
+    'Firewall Policies', 'SSL Inspection', 'Antivirus Profiles', 'IPS Sensors',
+    'Web Filter', 'App Control', 'DNS Filter', 'WAF Profiles', 'Email Filter',
+    'Video Filter', 'File Filter', 'Virtual Patch', 'LLM Profiles', 'VPN Phase1',
+    'VPN Phase2', 'SSL-VPN', 'SSL-VPN Portals', 'HA Config', 'Logging',
+    'DoS Policies', 'Anti-DoS Policies', 'Anti-DoS IPS', 'Anti-DoS Hardening',
+    'Admin Accounts', 'Interfaces', 'Global Hardening', 'Password Policy',
+    'SSH Config', 'NTP', 'Local-in', 'SNMP', 'System DNS', 'IKE Global',
+    'Security Fabric', 'FIPS-CC', 'FortiGuard', 'Policy Intelligence',
+    'Unused Objects', 'VIP Security', 'SD-WAN', 'Interface Exposure',
+    'Certificates', 'Fabric Connectors', 'AI/LLM Security', 'Enhanced Local-in',
+    'BGP Security', 'RADIUS', 'LDAP', 'SAML', 'Admin MFA',
+)
+
+
+class ReportOutput:
+    """A per-run output sink retaining report guidance before writing to disk.
+
+    No generated TXT file is read or scraped. The complete legacy report is a
+    shared technical reference, not falsely attributed to an individual finding.
+    """
+    def __init__(self, path, references):
+        self.path = Path(path)
+        self.references = references
+
+    def __str__(self):
+        return str(self.path)
+
+    def write_text(self, content, encoding='utf-8'):
+        if self.references is not None:
+            self.references[self.path.name] = content
+        return self.path.write_text(content, encoding=encoding)
+
+    def with_suffix(self, suffix):
+        return self.path.with_suffix(suffix)
+
+
+class Finding(str):
+    """Compatible severity string with optional structured, non-secret evidence."""
+    def __new__(cls, severity, title, **details):
+        obj = str.__new__(cls, '{}: {}'.format(severity, title))
+        obj.details = details
+        return obj
+
+
+class ReportRedactor:
+    """Remove configured credential values, including multiline quoted material.
+
+    Reports still contain topology and arbitrary free text; they are confidential.
+    Secret *field values* are removed even if echoed in a name or comment.
+    """
+    SECRET_FIELD = re.compile(
+        r'(?:password|passwd|psksecret|secret|private[-_]?key|access[-_]?key|'
+        r'api[-_]?key|token|community|certificate$|^ca$)', re.I)
+
+    def __init__(self, config_text):
+        import shlex
+        values = set()
+        # FortiOS quoted values can span multiple lines and contain escaped quotes.
+        assignment = re.compile(
+            r'^\s*set\s+(\S+)\s+("(?:\\.|[^"\\])*"|[^\r\n]+)', re.M)
+        for match in assignment.finditer(config_text):
+            field, raw = match.groups()
+            if self.SECRET_FIELD.search(field) and not field.endswith((
+                    '-policy', '-expiry', '-expire', '-renewal', '-warning')):
+                value = nv(raw)
+                if value and value.lower() not in ('enable', 'disable', 'none'):
+                    values.add(value)
+                    if raw.startswith('"'):
+                        try:
+                            values.update(shlex.split(raw))
+                        except ValueError:
+                            pass
+                    if value.startswith('ENC '):
+                        values.add(value[4:].strip().strip('"'))
+                    # Also remove each line of PEM and multiline private material.
+                    if '\n' in value:
+                        values.update(x.strip() for x in value.splitlines() if x.strip())
+        root, _ = parse_config_tree(config_text)
+        nodes = [root]
+        while nodes:
+            node = nodes.pop()
+            if node['kind'] == 'config' and node['name'] == 'system snmp community':
+                for obj in node['children']:
+                    value = nv(obj['settings'].get('name', ''))
+                    if value:
+                        values.add(value)
+            nodes.extend(node['children'])
+        self.values = sorted(values, key=len, reverse=True)
+        self.pattern = re.compile('|'.join(re.escape(v) for v in self.values)) if values else None
+
+    def text(self, value):
+        text = str(value)
+        if self.pattern:
+            text = self.pattern.sub('[REDACTED]', text)
+        text = re.sub(r'-----BEGIN [^-]+-----.*?-----END [^-]+-----',
+                      '[REDACTED MATERIAL]', text, flags=re.S)
+        # Covers credentials embedded in URLs, without changing ordinary URLs.
+        text = re.sub(r'(https?://)[^\s/@]+:[^\s/@]+@', r'\1[REDACTED]@', text)
+        return re.sub(r'([?&](?:api[_-]?key|token|password|secret)=)[^&\s]+',
+                      r'\1[REDACTED]', text, flags=re.I)
+
+    def clean(self, value):
+        if isinstance(value, dict):
+            return {self.text(k): self.clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.clean(v) for v in value]
+        return self.text(value) if isinstance(value, str) else value
+
+
+def detect_metadata(config_text, config_path):
+    version = re.search(r'^#config-version=\S*?-(\d+\.\d+\.\d+)-', config_text, re.M)
+    if not version:
+        version = re.search(r'\bFortiOS\s+v?(\d+\.\d+\.\d+)\b', config_text)
+    return {'filename': Path(config_path).name,
+            'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'fortios': version.group(1) if version else 'Unknown',
+            'hostname': nv(parse_system_global(config_text).get('hostname', '')) or 'Unknown',
+            'tool_version': __version__}
+
+
+def build_html_data(all_findings, config_text, config_path, references=None,
+                    coverage_notes=None, domain_status=None):
+    redactor = ReportRedactor(config_text)
+    findings = []
+    for domain, items in all_findings.items():
+        for ordinal, item in enumerate(items):
+            severity, sep, title = item.partition(':')
+            if severity not in (C, H, M, I) or not sep:
+                raise ValueError('Finding lacks a supported severity: {}'.format(domain))
+            details = dict(getattr(item, 'details', {}))
+            obj_match = re.search(r"(?:Policy\s+#?(\d+)|'([^']+)')", title)
+            obj = details.pop('object', None)
+            if obj is None and obj_match:
+                obj = obj_match.group(1) or obj_match.group(2)
+            cli_hint = title.split('CLI:', 1)[1].strip() if 'CLI:' in title else ''
+            stable = '{}\0{}\0{}\0{}'.format(domain, details.get('vdom', ''), item, ordinal)
+            findings.append(dict(
+                id=hashlib.sha256(stable.encode('utf-8')).hexdigest()[:16],
+                severity=severity, domain=domain, title=title.strip(),
+                description=details.pop('description', title.strip()), object=obj or '',
+                vdom=details.pop('vdom', 'Unscoped (legacy)'),
+                evidence=details.pop('evidence', 'See the original finding and technical references.'),
+                impact=details.pop('impact', 'Impact depends on the deployment; review the finding in context.'),
+                recommendation=details.pop('recommendation', 'Review this finding and the domain technical reference before making changes.'),
+                cli=details.pop('cli', ''), guidance=cli_hint,
+                **details))
+    summary = compute_summary(all_findings)
+    domains = []
+    for domain in dict.fromkeys(list(AUDIT_DOMAINS) + list(all_findings)):
+        counts = summary['by_section'].get(domain)
+        domains.append({'name': domain, 'counts': counts,
+                        'status': (domain_status or {}).get(domain) or ('Findings detected' if sum(counts.values()) else
+                                   'Audited; no findings (not a pass guarantee)')
+                                  if counts is not None else 'Not selected'})
+    # Redact configuration-derived content, not fixed schema keys or enums.
+    # A password literally equal to "HIGH" must not corrupt severity counters.
+    sanitized = []
+    for finding in findings:
+        clean = {key: (value if key in ('id', 'severity', 'domain') else redactor.clean(value))
+                 for key, value in finding.items()}
+        sanitized.append(clean)
+    return {'schema_version': 1, 'metadata': redactor.clean(detect_metadata(config_text, config_path)),
+            'summary': summary, 'findings': sanitized, 'domains': domains,
+            'references': redactor.clean(references or {}), 'notes': redactor.clean(coverage_notes or [])}
+
+
+def generate_html_report(all_findings, config_text, config_path, out_path,
+                         references=None, coverage_notes=None, domain_status=None):
+    data = build_html_data(all_findings, config_text, config_path, references, coverage_notes, domain_status)
+    payload = json.dumps(data, ensure_ascii=True).replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
+    # Hash authorizes only our static program; configuration data cannot add code.
+    import base64
+    script_hash = base64.b64encode(hashlib.sha256(HTML_SCRIPT.encode()).digest()).decode()
+    csp = "default-src 'none'; script-src 'sha256-{}'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; connect-src 'none'".format(script_hash)
+    page = HTML_TEMPLATE.replace('<!--REPORT_DATA-->', payload).replace(
+        '<!--REPORT_SCRIPT-->', HTML_SCRIPT).replace('<!--CSP-->', html.escape(csp, quote=True))
+    Path(out_path).write_text(page, encoding='utf-8')
+    return data
+
+
+HTML_TEMPLATE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="<!--CSP-->">
+<title>FortiGate • Security assessment</title>
+<style>
+:root{color-scheme:dark;--bg:#0b101b;--panel:#121b2a;--raised:#192437;--line:#28354a;--text:#eaf0fa;--muted:#a5b4cb;--accent:#66e3c4;--critical:#ff7b89;--high:#ffb16b;--medium:#f5d46c;--info:#83baff;--shadow:0 16px 40px #0002}
+
+:root[data-theme=light]{color-scheme:light;--bg:#f3f6fb;--panel:#fff;--raised:#edf2f8;--line:#d8e1ec;--text:#17243a;--muted:#51627a;--accent:#087e69;--critical:#b51e37;--high:#a34c08;--medium:#806000;--info:#1c60ad;--shadow:0 8px 30px #23395008}
+
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+button,input,select{font:inherit}
+button,select{cursor:pointer}
+button,input,select{color:var(--text);background:var(--raised);border:1px solid var(--line);border-radius:9px;padding:10px 13px}
+button:hover{border-color:var(--accent)}
+:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+a{color:var(--accent);text-decoration:none}
+p{margin:8px 0}
+h1,h2,h3{line-height:1.25;margin:0 0 12px}
+h1{font-size:clamp(27px,4vw,42px);letter-spacing:-1.5px}
+h2{font-size:18px;letter-spacing:-.3px}
+h3{font-size:14px}
+small,.muted{color:var(--muted)}
+.shell{max-width:1600px;margin:auto;display:grid;grid-template-columns:220px minmax(0,1fr)}
+aside{position:sticky;top:0;height:100vh;padding:32px 22px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:28px}
+.brand{font-size:18px;font-weight:750;letter-spacing:-.4px}
+.logo{display:inline-grid;place-items:center;width:32px;height:35px;background:var(--accent);color:var(--bg);border-radius:9px 9px 14px 14px;margin-right:9px}
+nav a{display:block;color:var(--muted);padding:11px 12px;border-radius:8px;margin-bottom:6px}
+nav a:first-child{color:var(--accent);background:var(--raised)}
+.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:2px;font-weight:700;color:var(--accent)}
+.aside-foot{margin-top:auto;font-size:12px;color:var(--muted)}
+main{padding:28px 36px 50px;min-width:0}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:34px}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin-bottom:26px}
+.hero p{max-width:630px;color:var(--muted)}
+.hero .tag{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.tag{display:inline-block;font-size:11px;letter-spacing:1px;border:1px solid var(--line);padding:5px 9px;border-radius:6px;white-space:nowrap}
+.cards{display:grid;grid-template-columns:1.3fr repeat(3,1fr);gap:16px;margin-bottom:22px}
+.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:15px;box-shadow:var(--shadow)}
+.card{padding:21px;min-width:0}
+.card .number{font-size:36px;font-weight:740;line-height:1.25;letter-spacing:-1px}
+.card.risk{border-top:3px solid var(--critical)}
+.stat-label{font-size:12px;color:var(--muted);margin-bottom:12px}
+.mini-counts{display:flex;gap:13px;font-size:12px;margin-top:10px;flex-wrap:wrap}
+.critical{color:var(--critical)}
+.high{color:var(--high)}
+.medium{color:var(--medium)}
+.info{color:var(--info)}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.45fr);gap:20px;margin-bottom:22px}
+.panel{padding:23px;min-width:0}
+.chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:18px}
+.donut-box{display:flex;align-items:center;gap:24px;justify-content:center;flex-wrap:wrap}
+.donut{width:168px;height:168px;flex-shrink:0}
+.legend{flex:1;min-width:130px}
+.legend-row{display:flex;justify-content:space-between;gap:25px;margin:10px 0}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
+.bars{max-height:284px;overflow:auto;padding-right:7px}
+.bar-row{margin:11px 0}
+.bar-title{display:flex;justify-content:space-between;gap:12px;font-size:12px;margin-bottom:5px}
+.bar-track{height:7px;background:var(--raised);display:flex;border-radius:5px;overflow:hidden}
+.bar-segment{height:100%;min-width:1px}
+.rank-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:18px}
+.rank-score{font-size:24px;font-weight:700;margin-bottom:8px}
+.section{margin:26px 0 16px;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+.filters{display:grid;grid-template-columns:minmax(180px,2fr) repeat(4,minmax(100px,1fr));gap:10px;margin:18px 0 14px}
+.filters label{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--muted)}
+.filters input,.filters select{width:100%;min-width:0}
+.resultbar{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:14px 0;color:var(--muted);font-size:12px}
+.finding{border:1px solid var(--line);background:var(--panel);border-radius:11px;margin:9px 0;overflow:hidden}
+.finding>summary{cursor:pointer;list-style:none;display:flex;align-items:flex-start;gap:13px;padding:17px}
+.finding>summary::-webkit-details-marker{display:none}
+.finding>summary:before{content:'+';font-size:18px;line-height:1.4;color:var(--muted)}
+.finding[open]>summary:before{content:'−'}
+.badge{font-size:10px;font-weight:800;letter-spacing:.5px;border:1px solid currentColor;padding:3px 7px;border-radius:5px;flex-shrink:0;margin-top:2px}
+.finding-title{font-weight:600;overflow-wrap:anywhere}
+.finding-meta{font-size:11px;color:var(--muted);margin-top:5px}
+.finding-body{padding:4px 22px 23px 47px;border-top:1px solid var(--line)}
+.finding-body h3{margin:18px 0 6px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+.finding-body p{overflow-wrap:anywhere}
+.finding-body pre,pre.reference{background:var(--bg);border:1px solid var(--line);padding:15px;border-radius:8px;overflow:auto;max-width:100%;font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.cli pre{white-space:pre;overflow-wrap:normal}
+.cli button{font-size:11px;padding:5px 10px}
+.empty{padding:50px 20px;text-align:center;border:1px dashed var(--line);border-radius:12px;color:var(--muted)}
+.coverage{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.coverage-item{border:1px solid var(--line);padding:12px;border-radius:8px;overflow-wrap:anywhere}
+.coverage-item small{display:block}
+.metadata{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
+.metadata dt{font-size:11px;color:var(--muted)}
+.metadata dd{margin:3px 0 0;overflow-wrap:anywhere}
+.notice{border-left:2px solid var(--accent);padding:10px 15px;background:var(--raised);border-radius:0 7px 7px 0;font-size:12px;margin-top:18px}
+.ref>summary{padding:13px;cursor:pointer}
+.footer{font-size:11px;color:var(--muted);display:flex;justify-content:space-between;margin-top:30px;border-top:1px solid var(--line);padding-top:16px}
+.hidden{display:none!important}
+#more{display:block;margin:18px auto}
+#status{font-size:12px;color:var(--accent)}
+
+@media(max-width:1150px){.shell{grid-template-columns:170px minmax(0,1fr)}
+main{padding:25px}
+.cards{grid-template-columns:repeat(2,1fr)}
+.filters{grid-template-columns:repeat(3,minmax(0,1fr))}
+.rank-grid{grid-template-columns:repeat(3,1fr)}
+}
+
+@media(max-width:780px){.shell{display:block}
+aside{height:auto;position:static;border-right:0;border-bottom:1px solid var(--line);padding:15px 20px;display:flex;flex-direction:row;align-items:center;justify-content:space-between}
+nav{display:none}
+.aside-foot{margin:0}
+main{padding:20px 15px}
+.grid{grid-template-columns:1fr}
+.hero{display:block}
+.hero .tag{margin-top:10px}
+.cards{gap:10px}
+.card{padding:17px}
+.card .number{font-size:29px}
+.coverage,.metadata{grid-template-columns:repeat(2,minmax(0,1fr))}
+.filters{grid-template-columns:repeat(2,minmax(0,1fr))}
+.rank-grid{grid-template-columns:repeat(2,1fr)}
+.finding>summary{gap:9px;padding:12px}
+.finding-body{padding:0 15px 16px}
+.top{margin-bottom:24px;flex-wrap:wrap}
+.footer{display:block}
+.panel{padding:18px}
+}
+
+@media print{ :root,:root[data-theme=dark]{--bg:#fff;--panel:#fff;--raised:#f0f2f5;--line:#ccc;--text:#111;--muted:#444;--accent:#087e69;--critical:#a1132c;--high:#984500;--medium:#705000;--info:#155c9b}
+body{font-size:10pt}
+.shell{display:block}
+aside,.actions,.filters,.resultbar,#more,button{display:none!important}
+main{padding:0}
+.card,.panel{box-shadow:none}
+.bars{max-height:none;overflow:visible}
+.finding,.card{break-inside:avoid}
+.finding-body pre{white-space:pre-wrap}
+.finding-body{display:block!important}
+details>summary{display:block}
+.coverage{grid-template-columns:repeat(3,1fr)}
+.grid{grid-template-columns:1fr 1fr}
+a{color:inherit}
+.panel{margin-bottom:15px}
+}
+
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}
+}
+
+</style></head><body>
+<div class="shell"><aside><div class="brand"><span class="logo">F</span>FortiGate<small style="display:block;margin:8px 0 0 42px;font-size:10px;letter-spacing:1.5px">SECURITY ANALYZER</small></div><nav aria-label="Report navigation"><a href="#overview">◈ &nbsp; Overview</a><a href="#findings">☷ &nbsp; Findings</a><a href="#coverage">◎ &nbsp; Audit coverage</a><a href="#references">⌘ &nbsp; Technical references</a><a href="#details">ⓘ &nbsp; Assessment details</a></nav><div class="aside-foot"><span class="eyebrow">Offline assessment</span><p>Local analysis.<br>No data uploaded.</p><span id="version"></span></div></aside>
+<main><header class="top"><span class="muted">REPORT / CONFIGURATION SECURITY</span><div class="actions"><button id="theme" type="button" aria-label="Toggle dark and light theme">◐ &nbsp; Theme</button><button id="print" type="button">Print / PDF</button></div></header>
+<section id="overview"><div class="hero"><div><div class="eyebrow">FortiGate configuration audit</div><h1>Security assessment</h1><p>Understand configuration exposure. Prioritize the changes that matter.</p></div><span class="tag" id="file"></span></div>
+<div class="cards"><div class="card risk"><div class="stat-label">OVERALL RISK</div><div class="number critical" id="risk"></div><p class="muted" id="score"></p><small>Weighted findings, not a security percentage.</small></div><div class="card"><div class="stat-label">TOTAL FINDINGS</div><div class="number" id="total"></div><div id="counts" class="mini-counts"></div></div><div class="card"><div class="stat-label">AUDIT COVERAGE</div><div class="number" id="executed"></div><p class="muted">domains executed</p><small id="not-selected"></small></div><div class="card"><div class="stat-label">PRIORITY FINDINGS</div><div class="number" id="priority"></div><p class="muted">critical + high severity</p><small>Review deployment context before changes.</small></div></div>
+<div class="grid"><section class="panel"><div class="chart-head"><h2>Severity distribution</h2><small>All findings</small></div><div class="donut-box"><svg id="donut" class="donut" viewBox="0 0 180 180" role="img" aria-labelledby="donut-title"><title id="donut-title">Severity distribution</title></svg><div id="legend" class="legend"></div></div></section><section class="panel"><div class="chart-head"><h2>Findings by domain</h2><small>Severity composition</small></div><div id="bars" class="bars"></div></section></div>
+<section class="panel"><div class="chart-head"><h2>Highest-risk domains</h2><small>C × 10 · H × 5 · M × 2 · I × 0.5</small></div><div id="ranks" class="rank-grid"></div></section></section>
+<section id="findings"><div class="section"><h2>Findings explorer</h2><span class="tag">CONFIGURATION EVIDENCE</span></div><div class="filters"><label>Search findings<input id="search" type="search" placeholder="Policy, object, keyword…"></label><label>Severity<select id="severity"><option value="">All severities</option><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>INFO</option></select></label><label>Audit domain<select id="domain"><option value="">All audited domains</option></select></label><label>VDOM / scope<select id="vdom"><option value="">All scopes</option></select></label><label>Sort by<select id="sort"><option value="highest">Highest severity</option><option value="lowest">Lowest severity</option><option value="domain">Audit domain</option><option value="title">Finding title</option><option value="original">Original order</option></select></label></div><div class="resultbar"><span id="result-count" role="status" aria-live="polite"></span><button id="reset" type="button">Reset filters</button></div><div id="list"></div><button id="more" type="button">Load more findings</button><div id="empty" class="empty hidden">No findings match these filters. Try another keyword or reset filters.</div><div id="status" role="status" aria-live="polite"></div></section>
+<section id="coverage"><div class="section"><h2>Audit coverage</h2><small>No findings does not establish a passing check.</small></div><div id="coverage-list" class="coverage"></div></section>
+<section id="references"><div class="section"><h2>Technical references &amp; existing CLI guidance</h2></div><p class="muted">Original domain report content, retained in memory during this run. Examples may contain placeholders or require adaptation. Confirm syntax for the installed FortiOS release and review operational impact.</p><div id="reference-list"></div></section>
+<section id="details" class="panel" style="margin-top:25px"><h2>Assessment details</h2><dl id="metadata" class="metadata"></dl><div class="notice" id="notes"><p>Static configuration analysis cannot validate live reachability, effective identity-provider MFA, peer behavior, certificate trust chains, or operational state. Unselected domains are not assessed.</p><p>Risk is CRITICAL with any critical finding or score ≥ 50; HIGH ≥ 25; MEDIUM ≥ 10; otherwise LOW. LOW is a score classification, not a security guarantee.</p><p>Reports include sensitive network context. Protect them as confidential audit artifacts. Configured credential values are redacted from HTML; legacy TXT/JSON keep their existing confidentiality behavior.</p></div></section><footer class="footer"><span>FortiGate UTM Security Analyzer · Jafar Tavana</span><span>Local. Self-contained. Entirely offline.</span></footer>
+<noscript><div class="notice">Enable JavaScript to explore this self-contained report. Existing TXT reports remain available without JavaScript.</div></noscript></main></div>
+<script id="report-data" type="application/json"><!--REPORT_DATA--></script><script><!--REPORT_SCRIPT--></script></body></html>'''
+
+HTML_SCRIPT = r'''"use strict";
+(() => {
+  const report=JSON.parse(document.getElementById('report-data').textContent);
+  const $=id=>document.getElementById(id), severities=['CRITICAL','HIGH','MEDIUM','INFO'], weights=[10,5,2,.5];
+  const el=(tag,cls,text)=>{
+    const n=document.createElement(tag);
+    if(cls)n.className=cls;
+    if(text!==undefined)n.textContent=String(text);
+    return n;
+  };
+  const svg=(tag,attrs)=>{
+    const n=document.createElementNS('http://www.w3.org/2000/svg',tag);
+    Object.entries(attrs).forEach(([k,v])=>n.setAttribute(k,String(v)));
+    return n;
+  };
+  const colors=()=>severities.map(s=>getComputedStyle(document.documentElement).getPropertyValue('--'+s.toLowerCase()).trim());
+  function theme(value){
+    document.documentElement.dataset.theme=value;
+    try{
+      localStorage.setItem('fortigate-report-theme',value);
+    }catch(_){
+    }drawDonut();
+  } let preferred='dark';
+  try{
+    preferred=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
+    const saved=localStorage.getItem('fortigate-report-theme');
+    if(['light','dark'].includes(saved))preferred=saved;
+  }catch(_){
+  } $('theme').addEventListener('click',()=>theme(document.documentElement.dataset.theme==='dark'?'light':'dark'));
+  const summary=report.summary, counts=summary.counts;
+  $('risk').textContent=summary.risk;
+  $('risk').className='number '+(summary.risk==='LOW'?'info':summary.risk.toLowerCase());
+  $('score').textContent='Risk score '+summary.score;
+  $('total').textContent=summary.total;
+  $('priority').textContent=counts.CRITICAL+counts.HIGH;
+  $('executed').textContent=Object.keys(summary.by_section).length;
+  $('not-selected').textContent=report.domains.filter(d=>d.status==='Not selected').length+' domains not selected';
+  $('file').textContent=report.metadata.filename;
+  $('version').textContent='v'+report.metadata.tool_version;
+  severities.forEach(s=>{
+    $('counts').append(el('span',s.toLowerCase(),counts[s]+' '+s));
+    const row=el('div','legend-row');
+    const name=el('span',s.toLowerCase());
+    name.append(el('span','dot'));
+    name.firstChild.style.background='var(--'+s.toLowerCase()+')';
+    name.append(document.createTextNode(s));
+    row.append(name,el('strong','',counts[s]));
+    $('legend').append(row);
+  });
+  function drawDonut(){
+    const d=$('donut');
+    d.replaceChildren(svg('title',{
+      id:'donut-title'
+    }));
+    d.firstChild.textContent=severities.map(s=>s+': '+counts[s]).join(', ');
+    d.append(svg('circle',{
+      cx:90,cy:90,r:67,fill:'none',stroke:'var(--raised)','stroke-width':20
+    }));
+    let offset=0;
+    const circumference=2*Math.PI*67;
+    severities.forEach((s,i)=>{
+      const length=summary.total?counts[s]/summary.total*circumference:0;
+      if(length)d.append(svg('circle',{
+        cx:90,cy:90,r:67,fill:'none',stroke:colors()[i],'stroke-width':20,'stroke-dasharray':length+' '+circumference,'stroke-dashoffset':-offset,transform:'rotate(-90 90 90)'
+      }));
+      offset+=length;
+    });
+    const n=svg('text',{
+      x:90,y:92,'text-anchor':'middle',fill:'var(--text)','font-size':30,'font-weight':700
+    });
+    n.textContent=summary.total;
+    const l=svg('text',{
+      x:90,y:114,'text-anchor':'middle',fill:'var(--muted)','font-size':10
+    });
+    l.textContent='FINDINGS';
+    d.append(n,l);
+  } theme(preferred);
+  const domains=Object.entries(summary.by_section).map(([name,c])=>({
+    name,counts:c,total:severities.reduce((a,s)=>a+c[s],0),score:severities.reduce((a,s,i)=>a+c[s]*weights[i],0)
+  }));
+  const max=Math.max(1,...domains.map(d=>d.total));
+  domains.filter(d=>d.total).sort((a,b)=>b.total-a.total).forEach(d=>{
+    const row=el('div','bar-row');
+    const label=el('div','bar-title');
+    label.append(el('span','',d.name),el('span','',d.total));
+    const track=el('div','bar-track');
+    track.setAttribute('role','img');
+    track.setAttribute('aria-label',d.name+': '+severities.map(s=>s+' '+d.counts[s]).join(', '));
+    severities.forEach(s=>{
+      if(!d.counts[s])return;
+      const b=el('span','bar-segment');
+      b.style.width=(d.counts[s]/max*100)+'%';
+      b.style.background='var(--'+s.toLowerCase()+')';
+      track.append(b);
+    });
+    row.append(label,track);
+    $('bars').append(row);
+  });
+  if(!summary.total)$('bars').append(el('p','muted','No findings in executed domains.'));
+  domains.filter(d=>d.total).sort((a,b)=>b.score-a.score).slice(0,5).forEach((d,i)=>{
+    const n=el('div','');
+    n.append(el('small','',String(i+1).padStart(2,'0')+' / '+d.name),el('div','rank-score',d.score));
+    const t=el('div','bar-track'), b=el('span','bar-segment');
+    b.style.width=(100*d.score/Math.max(1,...domains.map(x=>x.score)))+'%';
+    b.style.background='var(--accent)';
+    t.append(b);
+    n.append(t);
+    $('ranks').append(n);
+  });
+  if(!summary.total)$('ranks').append(el('p','muted','No ranked domains.'));
+  Object.keys(summary.by_section).sort().forEach(d=>{
+    const o=el('option','',d);
+    o.value=d;
+    $('domain').append(o);
+  });
+  [...new Set(report.findings.map(f=>f.vdom))].sort().forEach(v=>{
+    const o=el('option','',v);
+    o.value=v;
+    $('vdom').append(o);
+  });
+  report.domains.forEach(d=>{
+    const n=el('div','coverage-item');
+    n.append(el('strong','',d.name),el('small','',d.status));
+    $('coverage-list').append(n);
+  });
+  Object.entries(report.metadata).forEach(([k,v])=>{
+    const n=el('div','');
+    n.append(el('dt','',k.replaceAll('_',' ').toUpperCase()),el('dd','',v));
+    $('metadata').append(n);
+  });
+  report.notes.forEach(n=>$('notes').append(el('p','',n)));
+  async function copy(text,button){
+    try{
+      if(!navigator.clipboard)throw Error();
+      await navigator.clipboard.writeText(text);
+      button.textContent='Copied';
+    }catch(_){
+      const t=el('textarea','');
+      t.value=text;
+      t.setAttribute('readonly','');
+      document.body.append(t);
+      t.select();
+      let ok=false;
+      try{
+        ok=document.execCommand('copy');
+      }catch(_){
+      }t.remove();
+      button.textContent=ok?'Copied':'Select and copy below';
+      if(!ok){
+        const pre=button.parentElement.querySelector('pre');
+        if(pre){
+          const range=document.createRange();
+          range.selectNodeContents(pre);
+          const selection=window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }$('status').textContent='Clipboard unavailable. Commands selected for manual copying.';
+      }
+    }
+  } Object.entries(report.references).forEach(([name,text])=>{
+    const ref=el('details','ref panel'), head=el('summary','',name);
+    ref.append(head);
+    ref.addEventListener('toggle',()=>{
+      if(ref.open&&!ref.dataset.loaded){
+        ref.dataset.loaded='1';
+        const pre=el('pre','reference',text);
+        ref.append(pre);
+      }
+    }, {
+      once:false
+    });
+    $('reference-list').append(ref);
+  });
+  const indexed=report.findings.map((f,index)=>({
+    f,index,search:JSON.stringify(f).toLowerCase()
+  }));
+  let matches=[],limit=80;
+  function detail(f){
+    const d=el('details','finding');
+    d.id='finding-'+f.id;
+    const head=el('summary','');
+    const title=el('div','');
+    title.append(el('div','finding-title',f.title),el('div','finding-meta',[f.domain,f.object,f.vdom].filter(Boolean).join(' · ')));
+    head.append(el('span','badge '+f.severity.toLowerCase(),f.severity),title);
+    d.append(head);
+    function load(){
+      if(d.dataset.loaded)return;
+      d.dataset.loaded='1';
+      const body=el('div','finding-body');
+      [['Finding details',f.description],['Security impact',f.impact],['Configuration evidence',typeof f.evidence==='string'?f.evidence:JSON.stringify(f.evidence,null,2)],['Recommended remediation',f.recommendation]].forEach(([name,text])=>{
+        body.append(el('h3','',name),el(name==='Configuration evidence'?'pre':'p','',text));
+      });
+      body.append(el('h3','','FortiGate CLI remediation'));
+      if(f.cli||f.guidance){
+        const content=f.cli||f.guidance,block=el('div','cli'),button=el('button','',f.cli?'Copy commands':'Copy original guidance');
+        button.type='button';
+        button.addEventListener('click',()=>copy(content,button));
+        block.append(button,el('pre','',content));
+        if(!f.cli)block.append(el('p','muted','Original audit guidance; may be incomplete and require placeholders.'));
+        body.append(block);
+      }else{
+        body.append(el('p','muted',f.guidance||'No exact command is supplied for this finding. Review the technical references for existing guidance.'));
+      }body.append(el('p','muted',f.operational_note||'Review FortiOS compatibility, replace placeholders, and validate impact on management access, routing and production traffic before applying changes.'));
+      d.append(body);
+    } d.addEventListener('toggle',()=>{
+      if(d.open)load();
+    });
+    d.loadDetails=load;
+    return d;
+  } function render(){
+    const frag=document.createDocumentFragment();
+    matches.slice(0,limit).forEach(x=>frag.append(detail(x.f)));
+    $('list').replaceChildren(frag);
+    $('result-count').textContent=matches.length+' of '+report.findings.length+' findings · '+Math.min(limit,matches.length)+' displayed';
+    $('more').classList.toggle('hidden',limit>=matches.length);
+    $('empty').classList.toggle('hidden',matches.length!==0);
+  } function filter(){
+    const q=$('search').value.toLowerCase().trim(),s=$('severity').value,d=$('domain').value,v=$('vdom').value,sort=$('sort').value;
+    matches=indexed.filter(x=>(!q||x.search.includes(q))&&(!s||x.f.severity===s)&&(!d||x.f.domain===d)&&(!v||x.f.vdom===v));
+    const rank=s=>severities.indexOf(s);
+    matches.sort((a,b)=>{
+      if(sort==='highest')return rank(a.f.severity)-rank(b.f.severity)||a.index-b.index;
+      if(sort==='lowest')return rank(b.f.severity)-rank(a.f.severity)||a.index-b.index;
+      if(sort==='domain'||sort==='title')return a.f[sort].localeCompare(b.f[sort])||a.index-b.index;
+      return a.index-b.index;
+    });
+    limit=80;
+    render();
+  } let timer;
+  $('search').addEventListener('input',()=>{
+    clearTimeout(timer);
+    timer=setTimeout(filter,100);
+  });
+  ['severity','domain','vdom','sort'].forEach(id=>$(id).addEventListener('change',filter));
+  $('reset').addEventListener('click',()=>{
+    $('search').value='';
+    ['severity','domain','vdom'].forEach(id=>$(id).value='');
+    $('sort').value='highest';
+    filter();
+  });
+  $('more').addEventListener('click',()=>{
+    limit+=80;
+    render();
+  });
+  let printState=null;
+  function preparePrint(){
+    if(printState)return;
+    printState={
+      limit,open:[...document.querySelectorAll('#list details[open]')].map(d=>d.id)
+    };
+    limit=matches.length;
+    render();
+    document.querySelectorAll('#list details').forEach(d=>{
+      d.loadDetails();
+      d.open=true;
+    });
+    document.querySelectorAll('#reference-list details').forEach(d=>{
+      d.dataset.wasOpen=d.open?'1':'0';
+      d.open=true;
+      if(!d.dataset.loaded){
+        d.dataset.loaded='1';
+        d.append(el('pre','reference',report.references[d.firstChild.textContent]));
+      }
+    });
+  } window.addEventListener('beforeprint',preparePrint);
+  window.addEventListener('afterprint',()=>{
+    if(!printState)return;
+    limit=printState.limit;
+    const opened=printState.open;
+    printState=null;
+    render();
+    opened.forEach(id=>{
+      if($(id))$(id).open=true;
+    });
+    document.querySelectorAll('#reference-list details').forEach(d=>d.open=d.dataset.wasOpen==='1');
+  });
+  $('print').addEventListener('click',()=>{
+    preparePrint();
+    window.print();
+  });
+  filter();
+})();
+'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context-preserving parser for new audits. Legacy parsers remain compatible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_config_tree(text):
+    """Parse config/edit nesting, preserving VDOM boundaries and quoted values.
+
+    Malformed nesting is reported, never silently treated as an empty config.
+    Multiline quoted values cannot inject config/end control lines.
+    """
+    import shlex
+    root = {'kind': 'root', 'name': '', 'settings': {}, 'children': []}
+    stack, errors = [root], []
+    pending, start_line = [], 0
+    def quote_open(value):
+        quoted, escaped = False, False
+        for char in value:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = not quoted
+        return quoted
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if pending:
+            pending.append(raw)
+            if not quote_open(raw):
+                continue
+            line, pending = '\n'.join(pending), []
+        elif not line or line.startswith('#'):
+            continue
+        elif quote_open(line):
+            pending, start_line = [line], number
+            continue
+        parts = line.split(None, 1)
+        command, value = parts[0], parts[1] if len(parts) > 1 else ''
+        if command in ('config', 'edit'):
+            kind = command
+            if kind == 'edit' and stack[-1]['kind'] != 'config':
+                errors.append('Line {}: edit outside config'.format(number)); continue
+            if kind == 'config' and stack[-1]['kind'] == 'config':
+                # Flat parent blocks (router bgp) may contain nested tables.
+                pass
+            if not value:
+                errors.append('Line {}: missing {} name'.format(number, command)); continue
+            try:
+                if command == 'edit':
+                    names = shlex.split(value)
+                    if len(names) != 1:
+                        raise ValueError('An edit requires one object identifier')
+                    name = names[0]
+                else:
+                    name = ' '.join(value.split())
+            except ValueError:
+                errors.append('Line {}: malformed name'.format(number)); continue
+            node = {'kind': kind, 'name': name, 'settings': {}, 'children': []}
+            stack[-1]['children'].append(node); stack.append(node)
+        elif command in ('next', 'end'):
+            expected = 'edit' if command == 'next' else 'config'
+            if len(stack) == 1 or stack[-1]['kind'] != expected:
+                errors.append('Line {}: unmatched {}'.format(number, command))
+            else:
+                stack.pop()
+        elif command in ('set', 'unset', 'append'):
+            assignment = value.split(None, 1)
+            key = assignment[0] if assignment else ''
+            val = assignment[1] if len(assignment) > 1 else ''
+            if len(stack) == 1 or not key:
+                errors.append('Line {}: assignment outside block'.format(number)); continue
+            if command == 'unset':
+                stack[-1]['settings'].pop(key, None)
+            elif command == 'append':
+                stack[-1]['settings'][key] = (stack[-1]['settings'].get(key, '') + ' ' + val).strip()
+            else:
+                stack[-1]['settings'][key] = val
+        else:
+            errors.append('Line {}: unsupported configuration statement'.format(number))
+    if pending:
+        errors.append('Line {}: unterminated quoted value'.format(start_line))
+    if len(stack) != 1:
+        errors.append('Incomplete configuration: {} unclosed blocks'.format(len(stack)-1))
+    return root, errors
+
+
+def tree_blocks(node, name):
+    return [n for n in node['children'] if n['kind'] == 'config' and n['name'] == name]
+
+
+def tree_objects(node, name):
+    return [obj for block in tree_blocks(node, name) for obj in block['children'] if obj['kind'] == 'edit']
+
+
+def configuration_scopes(root):
+    """Return explicit global/unwrapped/VDOM containers; never merge names."""
+    result = []
+    globals_ = tree_blocks(root, 'global')
+    result.extend(('Global', n) for n in globals_)
+    vdoms = tree_objects(root, 'vdom')
+    result.extend((n['name'], n) for n in vdoms)
+    # Some backups list VDOM declarations first, then a second full vdom block.
+    # Repeated containers for one VDOM are combined without crossing boundaries.
+    other = [n for n in root['children'] if n['name'] not in ('global', 'vdom')]
+    if other:
+        result.insert(0, ('Unwrapped' if globals_ or vdoms else 'root',
+                          {'kind': 'root', 'name': '', 'settings': {}, 'children': other}))
+    merged = {}
+    for name, node in result:
+        key = (node['kind'], node['name'], name)
+        if key not in merged:
+            merged[key] = (name, dict(node, children=list(node['children'])))
+        else:
+            merged[key][1]['children'].extend(node['children'])
+    return list(merged.values())
+
+
+def scoped_finding(severity, rule_id, title, obj, vdom, evidence, impact, recommendation, cli=''):
+    # Only explicit fields with verified syntax receive a review example. Route
+    # policies and trust anchors require deployment-specific values, so no CLI
+    # is guessed for them. Never interpolate control characters into commands.
+    examples = {
+        'LDAP-IDENTITY': ('user ldap', 'server-identity-check', 'enable'),
+        'LDAP-TLS': ('user ldap', 'ssl-min-proto-version', 'TLSv1-2'),
+        'SAML-DIGEST': ('user saml', 'digest-method', 'sha256'),
+        'RADIUS-IDENTITY': ('user radius', 'server-identity-check', 'enable'),
+        'RADIUS-MESSAGE-AUTH': ('user radius', 'require-message-authenticator', 'enable'),
+    }
+    if not cli and rule_id in examples and all(ord(c) >= 32 and ord(c) != 127 for c in obj):
+        block, key, value = examples[rule_id]
+        quoted = '"' + obj.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        cli = '# Review example; first select scope: {}\nconfig {}\n    edit {}\n        set {} {}\n    next\nend'.format(
+            json.dumps(vdom, ensure_ascii=True), block, quoted, key, value)
+    return Finding(severity, '{} [{} / {}]: {}'.format(obj, vdom, rule_id, title),
+                   rule_id=rule_id, object=obj, vdom=vdom, evidence=evidence,
+                   description=title, impact=impact, recommendation=recommendation, cli=cli)
+
+
+def asn_number(value):
+    value = nv(value)
+    try:
+        if '.' in value:
+            high, low = map(int, value.split('.'))
+            return high * 65536 + low if 0 <= high <= 65535 and 0 <= low <= 65535 else None
+        return int(value) if 0 < int(value) <= 4294967295 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def audit_bgp(scope, vdom):
+    findings = []
+    count = 0
+    for bgp in tree_blocks(scope, 'router bgp'):
+        local_as = asn_number(bgp['settings'].get('as', ''))
+        groups = {n['name']: n for n in tree_objects(bgp, 'neighbor-group')}
+        ranges = tree_objects(bgp, 'neighbor-range') + tree_objects(bgp, 'neighbor-range6')
+        used = {nv(n['settings'].get('neighbor-group', '')) for n in ranges}
+        peers = [(n, 'neighbor') for n in tree_objects(bgp, 'neighbor')]
+        peers += [(groups[name], 'neighbor-group') for name in sorted(used) if name in groups]
+        for n in ranges:
+            group = nv(n['settings'].get('neighbor-group', ''))
+            if group not in groups:
+                findings.append(scoped_finding(M, 'BGP-GROUP', 'Neighbor range references a group absent from this backup.',
+                    n['name'], vdom, {'neighbor-group': group},
+                    'The supplied backup is insufficient to establish effective peer controls.',
+                    'Check the complete backup and repair the group binding if it is missing on the device.'))
+        for node, kind in peers:
+            count += 1
+            cfg = dict(node['settings'])
+            name = '{} {}'.format(kind, node['name'])
+            # Accommodate an explicit group binding if exported; never assume a
+            # similarly named peer inherits a template. Dynamic ranges use groups.
+            binding = nv(cfg.get('neighbor-group', ''))
+            if binding:
+                if binding not in groups:
+                    findings.append(scoped_finding(M, 'BGP-GROUP', 'Effective neighbor group unavailable.',
+                        name, vdom, {'neighbor-group': binding}, 'Inherited controls cannot be determined.',
+                        'Obtain the complete configuration and verify the referenced group.'))
+                    continue
+                cfg = dict(groups[binding]['settings'], **cfg)
+            if nv(cfg.get('shutdown')) == 'enable':
+                continue
+            remote_as = asn_number(cfg.get('remote-as', ''))
+            def add(sev, rule, title, evidence, impact, recommendation):
+                findings.append(scoped_finding(sev, rule, title, name, vdom, evidence, impact, recommendation))
+            if not nv(cfg.get('password', '')):
+                add(M, 'BGP-AUTH', 'No session authentication shown.', {'password': 'not configured'},
+                    'Session authentication can reduce peer impersonation risk; protection by tunnels is unknown.',
+                    'Review transport protection and coordinate supported BGP authentication with the peer. Encrypted secret strength cannot be inferred.')
+            if not local_as or not remote_as or local_as == remote_as:
+                continue  # Do not apply external-boundary requirements to iBGP or unknown ASNs.
+            families = [('', 'IPv4', 'activate')]
+            if nv(cfg.get('activate6', '')) == 'enable':
+                families.append(('6', 'IPv6', 'activate6'))
+            for suffix, label, activate in families:
+                if nv(cfg.get(activate, '')) == 'disable':
+                    continue
+                for direction in ('in', 'out'):
+                    keys = ['{}-{}{}'.format(prefix, direction, suffix) for prefix in ('prefix-list', 'route-map', 'filter-list', 'distribute-list')]
+                    if not any(nv(cfg.get(k, '')) for k in keys):
+                        add(M, 'BGP-FILTER-' + direction.upper(), '{} eBGP {}bound filtering not shown.'.format(label, direction),
+                            {k: 'not configured' for k in keys},
+                            'No neighbor-level policy is visible. Intended routes, upstream controls and route leaks cannot be established offline.',
+                            'Review intended route exchange and apply a restrictive policy where appropriate. A filter reference alone does not establish its effectiveness.')
+                limit_key = 'maximum-prefix' + suffix
+                limit = nv(cfg.get(limit_key, ''))
+                if not limit or limit == '0':
+                    add(M, 'BGP-LIMIT', '{} prefix ceiling not shown.'.format(label),
+                        {limit_key: limit or 'not configured'}, 'Unexpected route growth may exhaust resources.',
+                        'Set a ceiling based on the agreed route count and growth margin. Incorrect limits can tear down production sessions.')
+                if nv(cfg.get('maximum-prefix-warning-only' + suffix, '')) == 'enable':
+                    add(M, 'BGP-LIMIT-WARN', '{} prefix limit is warning-only.'.format(label),
+                        {'maximum-prefix-warning-only' + suffix: 'enable'},
+                        'Exceeding the prefix threshold may not enforce a protective session limit.',
+                        'Confirm monitoring and decide whether enforced limits suit this peer; review outage impact first.')
+            if nv(cfg.get('ebgp-enforce-multihop', '')) == 'enable':
+                ttl = nv(cfg.get('ebgp-multihop-ttl', ''))
+                if ttl.isdigit() and int(ttl) > 10:
+                    add(M, 'BGP-MULTIHOP', 'eBGP multihop TTL exceeds 10.', {'ebgp-multihop-ttl': ttl},
+                        'A large TTL permits a wider peer path than a short-hop design needs; this may be intentional.',
+                        'Verify the actual hop distance, tunnel design and ACLs before reducing the TTL.')
+        for name in ('redistribute', 'redistribute6'):
+            for n in tree_objects(bgp, name):
+                cfg = n['settings']
+                if n['name'] in ('connected', 'static') and nv(cfg.get('status')) == 'enable' and not nv(cfg.get('route-map')):
+                    findings.append(scoped_finding(M, 'BGP-REDIST', 'Enabled redistribution has no route-map shown.',
+                        name + ' ' + n['name'], vdom, {'status': 'enable', 'route-map': 'not configured'},
+                        'Routes may enter BGP beyond intended scope; outbound neighbor policies may still restrict advertisements.',
+                        'Review redistribution and outbound policies together. Add explicit selection where needed; validate reachability before applying.'))
+    return findings, count
+
+
+def audit_authentication(scope, vdom, selected):
+    results, counts = {}, {}
+    if 'RADIUS' in selected:
+        items = tree_objects(scope, 'user radius'); findings = []
+        for node in items:
+            c, name = node['settings'], node['name']
+            def add(sev, rule, title, evidence, impact, recommendation):
+                findings.append(scoped_finding(sev, rule, title, name, vdom, evidence, impact, recommendation))
+            transport = nv(c.get('transport-protocol', ''))
+            if transport in ('udp', 'tcp'):
+                add(M, 'RADIUS-TRANSPORT', 'RADIUS transport is not TLS.', {'transport-protocol': transport},
+                    'RADIUS transport is not encrypted end to end; an IPsec tunnel or trusted path may provide separate protection.',
+                    'Review path trust, patched RADIUS servers and Message-Authenticator enforcement. Consider RADSEC where the FortiOS release and server support it.')
+            if nv(c.get('auth-type')) in ('chap', 'ms_chap'):
+                add(M, 'RADIUS-METHOD', 'Legacy authentication method selected.', {'auth-type': nv(c['auth-type'])},
+                    'Legacy challenge-response methods can expose credentials to offline attacks depending on the environment.',
+                    'Coordinate a supported authentication method with the server and protect the transport. PAP is not automatically unsafe inside a protected channel.')
+            if transport == 'tls' and nv(c.get('server-identity-check')) == 'disable':
+                add(H, 'RADIUS-IDENTITY', 'TLS server identity checking explicitly disabled.', {'server-identity-check': 'disable'},
+                    'The connection may not authenticate the intended server identity.',
+                    'Install the appropriate trust chain and enable supported server identity validation. Test authentication before deployment.')
+            if nv(c.get('require-message-authenticator')) == 'disable':
+                add(H, 'RADIUS-MESSAGE-AUTH', 'RADIUS Message-Authenticator requirement explicitly disabled.', {'require-message-authenticator': 'disable'},
+                    'The client is configured to accept responses without requiring this integrity control.',
+                    'Patch and verify the RADIUS server, then enable this requirement on supported releases. Do not bypass it to hide server compatibility errors.')
+            if len(items) == 1 and not any(nv(c.get(k)) for k in ('secondary-server', 'tertiary-server')):
+                add(I, 'RADIUS-REDUNDANCY', 'No alternate RADIUS endpoint shown.', {'alternate-server': 'not shown'},
+                    'A single endpoint may be an availability dependency; a VIP or server-side HA cannot be determined offline.',
+                    'Verify service HA and failover. Multiple configured objects do not prove effective redundancy.')
+        results['RADIUS'], counts['RADIUS'] = findings, len(items)
+    if 'LDAP' in selected:
+        items = tree_objects(scope, 'user ldap'); findings = []
+        for node in items:
+            c, name = node['settings'], node['name']
+            def add(sev, rule, title, evidence, impact, recommendation):
+                findings.append(scoped_finding(sev, rule, title, name, vdom, evidence, impact, recommendation))
+            secure = nv(c.get('secure', ''))
+            if secure == 'disable':
+                add(H, 'LDAP-TRANSPORT', 'LDAP encryption explicitly disabled.', {'secure': 'disable'},
+                    'Directory credentials and queries may be exposed on an unprotected path.',
+                    'Configure LDAPS or STARTTLS with appropriate CA trust and server identity validation. Validate bind and login behavior first.')
+            if secure in ('ldaps', 'starttls'):
+                if nv(c.get('server-identity-check')) == 'disable':
+                    add(H, 'LDAP-IDENTITY', 'LDAP TLS server identity checking explicitly disabled.', {'secure': secure, 'server-identity-check': 'disable'},
+                        'Certificate name checks are bypassed; trust-chain validation alone may not identify the intended server.',
+                        'Match the configured hostname to the certificate SAN and enable identity checks on supported releases.')
+                if not nv(c.get('ca-cert')):
+                    add(I, 'LDAP-CA', 'No explicit LDAP CA reference shown.', {'secure': secure, 'ca-cert': 'not shown'},
+                        'The explicit trust anchor is not visible. This does not prove validation is disabled.',
+                        'Verify effective trust-store behavior on the deployed release and select the intended CA where required.')
+                tls = nv(c.get('ssl-min-proto-version', '')).lower()
+                if tls in ('sslv3', 'tlsv1', 'tlsv1-0', 'tlsv1-1'):
+                    add(H, 'LDAP-TLS', 'Legacy LDAP minimum TLS version configured.', {'ssl-min-proto-version': tls},
+                        'Connections can negotiate obsolete protocol versions.',
+                        'Coordinate TLS 1.2 or later with directory servers and validate compatibility before changing the minimum.')
+        results['LDAP'], counts['LDAP'] = findings, len(items)
+    if 'SAML' in selected:
+        items = tree_objects(scope, 'user saml'); findings = []
+        for node in items:
+            c, name = node['settings'], node['name']
+            def add(sev, rule, title, evidence, impact, recommendation):
+                findings.append(scoped_finding(sev, rule, title, name, vdom, evidence, impact, recommendation))
+            for key in ('single-sign-on-url', 'idp-single-sign-on-url', 'single-logout-url', 'idp-single-logout-url'):
+                if nv(c.get(key)).lower().startswith('http://'):
+                    add(H, 'SAML-HTTP', 'SAML browser endpoint uses HTTP.', {key: nv(c[key])},
+                        'Browser authentication exchanges may traverse an unencrypted endpoint.',
+                        'Use HTTPS endpoints and update both SP and IdP metadata together. Entity-ID identifiers are not transport URLs and are not flagged.')
+            if nv(c.get('digest-method')) == 'sha1':
+                add(M, 'SAML-DIGEST', 'SAML SHA-1 digest explicitly selected.', {'digest-method': 'sha1'},
+                    'SHA-1 is a legacy digest; this does not establish the algorithm used by every incoming IdP assertion.',
+                    'Coordinate SHA-256 with the IdP and verify SSO on the installed FortiOS version.')
+            if not nv(c.get('idp-cert')):
+                add(M, 'SAML-IDP-CERT', 'IdP certificate reference absent from supplied object.', {'idp-cert': 'not shown'},
+                    'The intended signing certificate cannot be identified from this object. Actual assertion validation is not testable offline.',
+                    'Obtain the full configuration and verify the intended IdP signing certificate and rotation process.')
+        results['SAML'], counts['SAML'] = findings, len(items)
+    return results, counts
+
+
+def admin_mfa_findings(a, vdom='Unscoped (legacy)'):
+    name = nv(a.get('name', a.get('_id', '')))
+    two_factor = nv(a.get('two-factor', a.get('twofactor', '')))
+    if two_factor in ('fortitoken', 'fortitoken-cloud', 'email', 'sms'):
+        return []
+    external = nv(a.get('remote-auth')) == 'enable' or nv(a.get('peer-auth')) == 'enable'
+    if external:
+        return [Finding(I, "Admin '{}': MFA potentially delegated externally — verify effective identity-provider policy.".format(name),
+                        object=name, vdom=vdom, rule_id='MFA-EXTERNAL',
+                        evidence={'remote-auth': nv(a.get('remote-auth')), 'peer-auth': nv(a.get('peer-auth'))},
+                        recommendation='Verify IdP MFA and fallback paths, including break-glass access. Backup data cannot establish external MFA enforcement.')]
+    if not two_factor or two_factor in ('disable', 'none'):
+        return [Finding(H, "Admin '{}': two-factor authentication not enabled.".format(name),
+                        object=name, vdom=vdom, rule_id='MFA-LOCAL',
+                        evidence={'two-factor': two_factor or 'not shown', 'remote-auth': nv(a.get('remote-auth')) or 'not shown'},
+                        recommendation='Review local account MFA and any documented break-glass exception. Stage token enrollment and retain tested recovery access.')]
+    return [Finding(I, "Admin '{}': unrecognized MFA mode — unable to determine.".format(name),
+                    object=name, vdom=vdom, rule_id='MFA-UNKNOWN', evidence={'two-factor': two_factor})]
+
+
+def crypto_transport_weaknesses(cfg):
+    """Explicit modern SSH fields and management TLS; no inferred defaults.
+
+    Supports the documented fields under system global or system ssh-config.
+    Does not duplicate existing VPN, certificate, or legacy SSH field checks.
+    """
+    findings = []
+    checks = [
+        ('ssh-enc-algo', lambda s: s.endswith('-cbc') or s.startswith(('arcfour', '3des', 'blowfish', 'cast128')), H, 'legacy SSH cipher'),
+        ('ssh-kex-algo', lambda s: s.endswith('-sha1'), H, 'legacy SHA-1 SSH key exchange'),
+        ('ssh-mac-algo', lambda s: 'md5' in s or s.startswith('hmac-sha1'), M, 'legacy SSH MAC'),
+        ('admin-https-ssl-versions', lambda s: s.lower() in ('sslv3', 'tlsv1', 'tlsv1-0', 'tlsv1-1'), H, 'obsolete management TLS version'),
+    ]
+    for key, weak, severity, label in checks:
+        bad = [value for value in nv(cfg.get(key, '')).split() if weak(value)]
+        if bad:
+            findings.append(Finding(severity, '{}: {} allowed — review interoperability before removing.'.format(key, label),
+                rule_id='CRYPTO-' + key.upper(), object=key, vdom='Global', evidence={key: ' '.join(bad)},
+                recommendation='Restrict this explicit allow-list to supported contemporary algorithms. Verify the installed release and maintain tested management recovery access.'))
+    return findings
+
+
+def run_extended_audits(config_text, selected):
+    """Return shared findings, explicit applicability statuses and coverage notes."""
+    root, errors = parse_config_tree(config_text)
+    results = {name: [] for name in selected}
+    counts = {name: 0 for name in selected}
+    notes = ['New checks evaluate explicit settings; absent version-dependent values remain unknown. No live session or identity-provider state is tested.']
+    if errors:
+        notes.extend(errors)
+        return results, {name: 'Unavailable: malformed or incomplete configuration' for name in selected}, notes
+    for vdom, scope in configuration_scopes(root):
+        if 'BGP Security' in selected:
+            finds, count = audit_bgp(scope, vdom)
+            results['BGP Security'].extend(finds); counts['BGP Security'] += count
+        authentication = [name for name in selected if name in ('RADIUS', 'LDAP', 'SAML')]
+        found, observed = audit_authentication(scope, vdom, authentication)
+        for name in found:
+            results[name].extend(found[name]); counts[name] += observed[name]
+        if 'Admin MFA' in selected:
+            items = tree_objects(scope, 'system admin')
+            counts['Admin MFA'] += len(items)
+            for node in items:
+                results['Admin MFA'].extend(admin_mfa_findings(dict(node['settings'], _id=node['name']), vdom))
+    statuses = {name: ('Not applicable: no configured objects in supplied scope' if counts[name] == 0 and not results[name]
+                       else 'Audited explicit configuration; runtime and omitted settings unknown') for name in selected}
+    if tree_objects(root, 'vdom'):
+        notes.append('New BGP/authentication checks keep VDOMs separate. Legacy audit domains still use the first matching block and must not be treated as complete multi-VDOM coverage.')
+    return results, statuses, notes
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="FortiGate UTM Security Analyzer v3.0 — FortiOS 6.x/7.x/8.0 deep config audit.",
+        description="FortiGate UTM Security Analyzer v4.1.0 — FortiOS 6.x/7.x/8.0 deep config audit.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -5385,6 +6403,13 @@ Examples:
     parser.add_argument("-ai",        action="store_true", help="AI/LLM application audit (ChatGPT, Gemini, DeepSeek, data sovereignty, LLM profiles)")
     parser.add_argument("-s",      action="store_true", help="System hardening (admin, interface, global, SNMP, SSH, NTP, DNS, CSF, FIPS, IKE, local-in)")
     parser.add_argument("--summary", action="store_true", help="Executive summary + JSON export")
+    parser.add_argument('-bgp', '--bgp', action='store_true', help='VDOM-aware BGP configuration security audit')
+    parser.add_argument('-auth', '--auth', action='store_true', help='RADIUS, LDAP, SAML and administrator MFA audits')
+    parser.add_argument('--radius', action='store_true', help='RADIUS hardening audit')
+    parser.add_argument('--ldap', action='store_true', help='LDAP hardening audit')
+    parser.add_argument('--saml', action='store_true', help='SAML hardening audit')
+    parser.add_argument('--mfa', action='store_true', help='Administrator MFA audit (included in -s)')
+    parser.add_argument("--html", action="store_true", help="Additional self-contained offline HTML report (explicit opt-in)")
     parser.add_argument("--all",   action="store_true", help="Run all audit modules")
 
     args = parser.parse_args()
@@ -5393,12 +6418,14 @@ Examples:
         for attr in ["f","i","av","ips","wf","app","dns","waf","email","video","file",
                      "vpatch","llm","utm","vpn","sslvpn","ha","log","dos","antidos",
                      "intel","unused","vip","sdwan","iface","cert","fabric","ai",
-                     "s","summary"]:
+                     "s","summary","bgp","auth"]:
             setattr(args, attr, True)
 
     cfg_text = read_config(args.config)
     base = Path(args.config).name
-    out = lambda suffix: Path(f"{base}{suffix}")
+    references = {} if args.html else None
+    out = lambda suffix: (Path(f"{base}{suffix}") if suffix == "_SUMMARY.txt"
+                          else ReportOutput(f"{base}{suffix}", references))
 
     print(f"[*] Parsing config: {args.config}")
 
@@ -5668,8 +6695,40 @@ Examples:
     if args.s:
         # Enhanced local-in within system report
         elip_finds = enhanced_local_in_weaknesses(local_in, local_in6, interfaces)
-        if elip_finds:
-            all_findings["Enhanced Local-in"] = elip_finds
+        all_findings["Enhanced Local-in"] = elip_finds
+
+    selected = []
+    if args.bgp:
+        selected.append('BGP Security')
+    for name in ('RADIUS', 'LDAP', 'SAML'):
+        if args.auth or getattr(args, name.lower()):
+            selected.append(name)
+    if (args.auth or args.mfa) and not args.s:
+        selected.append('Admin MFA')  # -s already evaluates MFA: avoid duplicates.
+    extended, statuses, coverage_notes = run_extended_audits(cfg_text, selected) if selected else ({}, {}, [])
+    if args.s:
+        statuses['Admin MFA'] = 'Included in Admin Accounts (-s); not counted twice'
+    for domain, findings in extended.items():
+        all_findings[domain] = findings
+        slug = domain.lower().replace(' ', '_')
+        p = out('_' + slug + '_report.txt')
+        safe = ReportRedactor(cfg_text)
+        sections = [('Scope', statuses[domain]), ('Limitations', '\n'.join(coverage_notes))]
+        for finding in findings:
+            detail = getattr(finding, 'details', {})
+            sections.append((str(finding), 'Evidence: ' + json.dumps(detail.get('evidence', {}), ensure_ascii=False) +
+                             '\nImpact: ' + detail.get('impact', 'Review the finding in deployment context.') +
+                             '\nRecommendation: ' + detail.get('recommendation', 'Review the affected configuration.') +
+                             ('\nCLI:\n' + detail['cli'] if detail.get('cli') else '\nNo exact CLI supplied; coordinate version-specific changes.')))
+        write_report(p, 'FortiGate ' + domain + ' Audit', [(safe.text(h), safe.text(c)) for h, c in sections])
+        print(f"[+] {domain:27} -> {p}")
+    if re.search(r'^\s*config vdom\s*$', cfg_text, re.M) and not coverage_notes:
+        coverage_notes.append('Legacy audit domains use the first matching block. Complete multi-VDOM coverage is unavailable; new BGP/authentication checks support explicit VDOM scopes.')
+
+    if args.html:
+        p = Path(f"{base}_REPORT.html")
+        generate_html_report(all_findings, cfg_text, args.config, p, references, coverage_notes, statuses)
+        print(f"[+] Offline HTML dashboard     -> {p}")
 
     if args.summary and all_findings:
         p = out("_SUMMARY.txt")
@@ -5686,7 +6745,7 @@ Examples:
                 args.waf, args.email, args.video, args.file, args.vpatch, args.llm,
                 args.vpn, args.sslvpn, args.ha, args.log, args.dos, args.antidos,
                 args.intel, args.unused, args.vip, args.sdwan, args.iface, args.cert,
-                args.fabric, args.ai, args.s]):
+                args.fabric, args.ai, args.s, args.bgp, args.auth, args.radius, args.ldap, args.saml, args.mfa]):
         print("[!] No audit flags specified. Use --all for everything, or --help for options.")
 
 

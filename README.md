@@ -1,23 +1,40 @@
 # 🔐 FortiGate UTM Security Analyzer
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.0-blue?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/version-4.1.0-blue?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge&logo=python&logoColor=white" />
   <img src="https://img.shields.io/badge/FortiOS-6.x%20%7C%207.x%20%7C%208.0-red?style=for-the-badge" />
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Checks-300%2B-orange?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Audit%20Domains-35-purple?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/Lines%20of%20Code-5695-grey?style=for-the-badge" />
 </p>
 
 <p align="center">
-  <strong>The most comprehensive open-source FortiGate security configuration auditor.</strong><br/>
+  <strong>Offline FortiGate security auditing with an interactive HTML dashboard.</strong><br/>
   Point it at a <code>show full-configuration</code> backup. Get 300+ severity-tagged findings<br/>
   across 35 audit domains — every security plane, every layer, every FortiOS version.
 </p>
 
 ---
+
+## What's new in 4.1.0
+
+Generate a self-contained, entirely offline HTML security assessment alongside existing reports:
+
+```bash
+python3 utm.py -c sample_config.conf --all --html
+python3 utm.py -c firewall.conf -s -vpn -cert --html
+python3 utm.py -c firewall.conf -bgp -auth --summary --html
+```
+
+Open `<input-basename>_REPORT.html` directly in a current browser. It includes risk cards, three chart views, search, combined severity/domain/scope filters, sorting, expandable evidence and remediation, copy controls, dark/light modes and print/PDF styling. No third-party Python package, remote font, CDN, JavaScript library or build step is required. `--html` is explicit opt-in; it does not silently change which domains run.
+
+New BGP, RADIUS, LDAP and SAML checks use explicit VDOM scopes. Administrator MFA distinguishes potentially delegated external authentication from missing local MFA, and explicit modern SSH/TLS settings have additional checks. **Legacy audit domains still have incomplete multi-VDOM coverage.** Version-dependent omitted values remain unknown in new checks. A report with no findings is not a passing security certification.
+
+Existing flags and TXT/JSON schemas remain available. `--all` includes the new domains, so it adds report files/domain keys. The original sample remains **310 findings, score 876.5**. Configured credential values are redacted from HTML; arbitrary free text and legacy TXT/JSON still require confidentiality review.
+
+See [dashboard usage, complete new check inventory, limitations, compatibility and syntax references](docs/HTML_AND_AUDITS.md). Run tests with `python3 -m unittest discover -s tests -v`. Python 3.8/3.11/3.14 CI is configured; real-browser visual/interaction validation remains outstanding.
 
 ## 📋 Table of Contents
 
@@ -154,6 +171,7 @@ New combined check that's much more impactful than the previous per-policy check
 | v2.0 | 2026-06-29 | 1,826 | 13 | IPS, WAF, WebFilter, AppControl, DNS, VPN, SSL-VPN, HA, logging, executive summary |
 | v3.0 | 2026-06-30 | 2,555 | 25 | FortiOS 8.0 support, dual-mode SSL/AV parsers, LLM profile, IKE global, SNMP, SSH hardening, password policy, FIPS, DoS, IPv6, FA2/FA3, syslogd1-4, event filter, disk logging |
 | **v4.0** | **2026-07-04** | **5,695** | **35** | **Policy intelligence (shadowed/duplicate), unused objects, VIP security, Anti-DoS full audit, SD-WAN, interface exposure score, certificate audit, fabric connectors, AI/LLM security, enhanced local-in** |
+| **v4.1.0** | **2026-11-03** | Incremental | New scoped domains | **Offline HTML dashboard; BGP/RADIUS/LDAP/SAML; MFA classification; explicit SSH/TLS checks; regression tests. See current limitations above.** |
 
 ---
 
