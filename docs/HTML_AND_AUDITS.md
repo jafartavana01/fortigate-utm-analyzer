@@ -10,7 +10,7 @@ python3 utm.py -c firewall.conf -auth --summary --html
 python3 utm.py -c firewall.conf --radius --ldap --saml --mfa --html
 ```
 
-Open `firewall.conf_REPORT.html` directly in a current browser. No server, internet connection, fonts, CDN, Node build, or additional Python package is required. Outputs use the **input basename in the current working directory**, preserving the original behavior. Repeated runs with the same basename overwrite their corresponding outputs; select separate output directories when assessing different devices with identical filenames.
+Open `firewall.conf_REPORT.html` directly in a current browser. No server, internet connection, fonts, CDN, Node build, or additional Python package is required. Outputs use the **input basename in the current working directory** by default. Pass `--out-dir DIRECTORY` (alias: `--output-dir DIRECTORY`) to create and use a specific output directory for every TXT, JSON, summary and HTML report. For example: `python3 utm.py -c firewall.conf --all --html --out-dir ./reports/firewall`. Missing parent directories are created automatically. Repeated runs with the same basename in the same output directory overwrite their corresponding outputs; use different directories for separate assessments.
 
 `--html` explicitly adds a dashboard; `--all` retains text/JSON operation unless `--html` is supplied. `--html` alone produces a report with no executed audit domains, never silently runs a full audit. `--summary` alone retains its original warning and produces no summary. Individual UTM flags retain their original grouped behavior: for example, `-ips` executes the entire UTM profile group. The HTML coverage list reflects the domains actually collected, including that group.
 
