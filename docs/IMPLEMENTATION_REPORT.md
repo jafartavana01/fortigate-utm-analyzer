@@ -62,7 +62,7 @@ python3 -m unittest discover -s tests -v
 git diff --check
 ```
 
-The suite exercises all 29 original domain flags as subcases. Node syntax and the DOM harness passed. Those checks do **not** replace a browser: no Chromium executable was available, so pixel layout, actual file-URL behavior, clipboard permissions, browser printing and browser accessibility still need verification. No screenshot is fabricated or supplied. Python version-matrix CI is configured; local success is not a claim that all remote interpreter jobs have run.
+The suite exercises all 29 original domain flags as subcases. Node syntax and the DOM harness passed. Those checks do **not** replace a browser: no Chromium executable was available, so pixel layout, actual file-URL behavior, clipboard permissions, browser printing and browser accessibility still need verification. No screenshot is fabricated or supplied. GitHub started the Python 3.8/3.11/3.14 matrix on the initial implementation commit, but all three jobs were marked failed before any steps were recorded. The job-log endpoint returned HTTP 404 and no cause was exposed through the available connector. Remote CI is therefore blocked/unverified; no remote test success is claimed. Local success does not establish remote interpreter compatibility.
 
 ## G. Usage examples
 
