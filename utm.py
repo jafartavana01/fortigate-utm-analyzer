@@ -245,84 +245,64 @@ def parse_ntp(text: str) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_ssl_profiles_v2(text: str) -> List[Dict[str, Any]]:
-    """
-    Handles BOTH old flat ssl-ssh-profile (6.x) and new per-protocol
-    sub-block format (7.x / 8.0).  Returns enriched dicts.
-    """
-    lines = text.splitlines()
-    profiles: List[Dict[str, Any]] = []
-    in_block = False
-    current: Dict[str, Any] = {}
-    sub_proto: str = ""
-    sub_depth = 0
+    """Parse every SSL/SSH profile block, including repeated VDOM sections.
 
-    PROTOCOLS = {"https", "ftps", "imaps", "pop3s", "smtps", "ssh",
+    Only top-level edit/next delimit profiles. Nested config sections may have
+    their own edit/next commands (for example, ssl-exempt); those must never
+    terminate or replace an enclosing inspection profile.
+    """
+    profiles: List[Dict[str, Any]] = []
+    current = None
+    in_block = False
+    nested_blocks: List[str] = []
+    protocols = {"https", "ftps", "imaps", "pop3s", "smtps", "ssh",
                  "dot", "quic", "ftp", "imap", "pop3", "smtp"}
 
-    for raw in lines:
+    for raw in text.splitlines():
         line = raw.strip()
-
-        if line == "config firewall ssl-ssh-profile":
-            in_block = True
-            current = {}
-            sub_proto = ""
-            sub_depth = 0
-            continue
         if not in_block:
+            if line == "config firewall ssl-ssh-profile":
+                in_block = True
+                current = None
+                nested_blocks = []
             continue
 
-        if line == "end" and sub_depth == 0:
-            if current:
-                profiles.append(current)
-            break
+        if line.startswith("config "):
+            nested_blocks.append(line[7:].strip())
+            continue
+
+        if line == "end":
+            if nested_blocks:
+                nested_blocks.pop()
+            else:
+                if current is not None:
+                    profiles.append(current)
+                current = None
+                in_block = False  # Continue: another VDOM may declare profiles.
+            continue
+
+        if nested_blocks:
+            # Known per-protocol settings belong to the enclosing profile.
+            # Ignore nested table rows, including their edit/next delimiters.
+            if (current is not None and len(nested_blocks) == 1
+                    and nested_blocks[0] in protocols and line.startswith("set ")):
+                key, value = parse_set_line(line)
+                if key:
+                    current[f"{nested_blocks[0]}.{key}"] = value
+            continue
 
         if line.startswith("edit "):
-            if current:
+            if current is not None:
                 profiles.append(current)
-            obj_id = line.split(None, 1)[1].strip().strip('"')
-            current = {"_id": obj_id}
-            sub_proto = ""
-            sub_depth = 0
-            continue
-
-        if line == "next":
-            if current:
+            current = {"_id": line.split(None, 1)[1].strip().strip('"')}
+        elif line == "next":
+            if current is not None:
                 profiles.append(current)
-            current = {}
-            sub_proto = ""
-            sub_depth = 0
-            continue
-
-        if line.startswith("config ") and sub_depth == 0:
-            proto_candidate = line[7:].strip()
-            if proto_candidate in PROTOCOLS:
-                sub_proto = proto_candidate
-                sub_depth = 1
-                continue
-            else:
-                sub_depth += 1
-                continue
-
-        if sub_depth > 0:
-            if line.startswith("config "):
-                sub_depth += 1
-            elif line == "end":
-                sub_depth -= 1
-                if sub_depth == 0:
-                    sub_proto = ""
-            elif line == "next":
-                sub_proto = ""
-                sub_depth = max(0, sub_depth - 1)
-            elif line.startswith("set ") and sub_proto:
-                k, v = parse_set_line(line)
-                if k:
-                    current[f"{sub_proto}.{k}"] = v
-            continue
-
-        if line.startswith("set "):
-            k, v = parse_set_line(line)
-            if k:
-                current[k] = v
+            current = None
+        elif line.startswith("set ") and current is not None:
+            key, value = parse_set_line(line)
+            if key:
+                current[key] = value
 
     return profiles
 
